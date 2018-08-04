@@ -3,6 +3,7 @@
 #include "caffe2/core/context.h"
 #include "caffe2/core/logging.h"
 #include "caffe2/core/operator.h"
+#include "caffe2/utils/math.h"
 
 namespace caffe2 {
 

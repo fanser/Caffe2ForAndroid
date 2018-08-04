@@ -32,7 +32,7 @@ void LSTMUnit(
     const float forget_bias,
     Context* /*context*/) {
   for (int n = 0; n < N; ++n) {
-    const bool valid = t < seqLengths[n];
+    const bool valid = seqLengths == nullptr || t < seqLengths[n];
 
     for (int d = 0; d < D; ++d) {
       if (!valid) {
@@ -82,7 +82,7 @@ void LSTMUnitGradient(
     const float forget_bias,
     Context* /*context*/) {
   for (int n = 0; n < N; ++n) {
-    const bool valid = t < seqLengths[n];
+    const bool valid = seqLengths == nullptr || t < seqLengths[n];
 
     for (int d = 0; d < D; ++d) {
       T* c_prev_diff = C_prev_diff + d;
@@ -143,6 +143,9 @@ class LSTMUnitOp : public Operator<Context> {
             static_cast<float>(OperatorBase::template GetSingleArgument<float>(
                 "forget_bias",
                 0.0))),
+        sequence_lengths_(OperatorBase::template GetSingleArgument<bool>(
+            "sequence_lengths",
+            true)),
         drop_states_(OperatorBase::template GetSingleArgument<bool>(
             "drop_states",
             false)) {}
@@ -151,6 +154,9 @@ class LSTMUnitOp : public Operator<Context> {
 
   template <typename T>
   bool DoRunWithType() {
+    // handle potentially-missing sequence lengths input
+    const size_t TIMESTEP = SEQ_LENGTHS + (sequence_lengths_ ? 1 : 0);
+
     // Extract N
     const auto N = Input(CELL_T_M_1).dim(1);
 
@@ -162,9 +168,15 @@ class LSTMUnitOp : public Operator<Context> {
     const auto* H_prev = Input(HIDDEN_T_M_1).template data<T>();
     const auto* C_prev = Input(CELL_T_M_1).template data<T>();
     const auto* X = Input(GATES).template data<T>();
-    CAFFE_ENFORCE_EQ(Input(SEQ_LENGTHS).size(), N);
-    const auto* seqLengths = Input(SEQ_LENGTHS).template data<int32_t>();
-    const auto t = OperatorBase::Input<Tensor<CPUContext>>(TIMESTEP)
+
+    const int32_t* seqLengths = nullptr;
+    if (sequence_lengths_) {
+      CAFFE_ENFORCE_EQ(Input(SEQ_LENGTHS).size(), N);
+      seqLengths = Input(SEQ_LENGTHS).template data<int32_t>();
+    }
+
+    const auto t = static_cast<OperatorBase*>(this)
+                       ->Input<Tensor>(TIMESTEP, CPU)
                        .template data<int32_t>()[0];
     Output(CELL_T)->ResizeLike(Input(CELL_T_M_1));
     auto* C = Output(CELL_T)->template mutable_data<T>();
@@ -191,10 +203,13 @@ class LSTMUnitOp : public Operator<Context> {
   }
 
  protected:
-  INPUT_TAGS(HIDDEN_T_M_1, CELL_T_M_1, GATES, SEQ_LENGTHS, TIMESTEP);
+  INPUT_TAGS(HIDDEN_T_M_1, CELL_T_M_1, GATES, SEQ_LENGTHS);
+  // additional input tags are determined dynamically based on whether
+  // sequence_lengths is present.
   OUTPUT_TAGS(HIDDEN_T, CELL_T);
 
   float forget_bias_;
+  bool sequence_lengths_;
 
  private:
   bool drop_states_;
@@ -209,6 +224,9 @@ class LSTMUnitGradientOp : public Operator<Context> {
             static_cast<float>(OperatorBase::template GetSingleArgument<float>(
                 "forget_bias",
                 0.0))),
+        sequence_lengths_(OperatorBase::template GetSingleArgument<bool>(
+            "sequence_lengths",
+            true)),
         drop_states_(OperatorBase::template GetSingleArgument<bool>(
             "drop_states",
             false)) {}
@@ -216,6 +234,14 @@ class LSTMUnitGradientOp : public Operator<Context> {
 
   template <typename T>
   bool DoRunWithType() {
+    // handle potentially-missing sequence lengths input
+    const size_t inputOffset = SEQ_LENGTHS + (sequence_lengths_ ? 1 : 0);
+    const size_t TIMESTEP = inputOffset;
+    const size_t HIDDEN_T = inputOffset + 1;
+    const size_t CELL_T = inputOffset + 2;
+    const size_t HIDDEN_T_GRAD = inputOffset + 3;
+    const size_t CELL_T_GRAD = inputOffset + 4;
+
     // Extract N
     const auto N = Input(CELL_T_M_1).dim(1);
 
@@ -226,13 +252,20 @@ class LSTMUnitGradientOp : public Operator<Context> {
     CAFFE_ENFORCE_EQ(4 * D, G);
     const auto* C_prev = Input(CELL_T_M_1).template data<T>();
     const auto* X = Input(GATES).template data<T>();
-    const auto t = OperatorBase::Input<Tensor<CPUContext>>(TIMESTEP)
+    const auto t = static_cast<OperatorBase*>(this)
+                       ->Input<Tensor>(TIMESTEP, CPU)
                        .template data<int32_t>()[0];
     const auto* C = Input(CELL_T).template data<T>();
     const auto* H = Input(HIDDEN_T).template data<T>();
     const auto* C_diff = Input(CELL_T_GRAD).template data<T>();
     const auto* H_diff = Input(HIDDEN_T_GRAD).template data<T>();
-    const auto* seqLengths = Input(SEQ_LENGTHS).template data<int32_t>();
+
+    const int32_t* seqLengths = nullptr;
+    if (sequence_lengths_) {
+      CAFFE_ENFORCE_EQ(Input(SEQ_LENGTHS).size(), N);
+      seqLengths = Input(SEQ_LENGTHS).template data<int32_t>();
+    }
+
     Output(HIDDEN_T_M_1_GRAD)->ResizeLike(Input(HIDDEN_T_M_1));
     auto* H_prev_diff = Output(HIDDEN_T_M_1_GRAD)->template mutable_data<T>();
     Output(CELL_T_M_1_GRAD)->ResizeLike(Input(CELL_T_M_1));
@@ -265,19 +298,13 @@ class LSTMUnitGradientOp : public Operator<Context> {
   }
 
  protected:
-  INPUT_TAGS(
-      HIDDEN_T_M_1,
-      CELL_T_M_1,
-      GATES,
-      SEQ_LENGTHS,
-      TIMESTEP,
-      HIDDEN_T,
-      CELL_T,
-      HIDDEN_T_GRAD,
-      CELL_T_GRAD, );
+  INPUT_TAGS(HIDDEN_T_M_1, CELL_T_M_1, GATES, SEQ_LENGTHS);
+  // additional input tags are determined dynamically based on whether
+  // sequence_lengths is present.
   OUTPUT_TAGS(HIDDEN_T_M_1_GRAD, CELL_T_M_1_GRAD, GATES_GRAD);
 
   float forget_bias_;
+  bool sequence_lengths_;
 
  private:
   bool drop_states_;

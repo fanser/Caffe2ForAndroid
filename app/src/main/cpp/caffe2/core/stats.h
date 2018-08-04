@@ -200,6 +200,40 @@ class AvgExportedStat : public ExportedStat {
   }
 };
 
+class StdDevExportedStat : public ExportedStat {
+  // Uses an offset (first_) to remove issue of cancellation
+  // Variance is then (sumsqoffset_ - (sumoffset_^2) / count_) / (count_ - 1)
+ private:
+  ExportedStat count_;
+  ExportedStat sumsqoffset_;
+  ExportedStat sumoffset_;
+  std::atomic<int64_t> first_{std::numeric_limits<int64_t>::min()};
+  int64_t const_min_{std::numeric_limits<int64_t>::min()};
+
+ public:
+  StdDevExportedStat(const std::string& gn, const std::string& n)
+      : ExportedStat(gn, n + "/sum"),
+        count_(gn, n + "/count"),
+        sumsqoffset_(gn, n + "/sumsqoffset"),
+        sumoffset_(gn, n + "/sumoffset") {}
+
+  int64_t increment(int64_t value = 1) {
+    first_.compare_exchange_strong(const_min_, value);
+    int64_t offset_value = first_.load();
+    int64_t orig_value = value;
+    value -= offset_value;
+    count_.increment();
+    sumsqoffset_.increment(value * value);
+    sumoffset_.increment(value);
+    return ExportedStat::increment(orig_value);
+  }
+
+  template <typename T, typename Unused1, typename... Unused>
+  int64_t increment(T value, Unused1, Unused...) {
+    return increment(value);
+  }
+};
+
 class DetailedExportedStat : public ExportedStat {
  private:
   std::vector<ExportedStat> details_;
@@ -221,6 +255,25 @@ class DetailedExportedStat : public ExportedStat {
       details_[detailIndex].increment(value);
     }
     return ExportedStat::increment(value);
+  }
+};
+
+class StaticStat : public Stat {
+ private:
+  StatValue* value_;
+
+ public:
+  StaticStat(const std::string& groupName, const std::string& name)
+      : Stat(groupName, name),
+        value_(StatRegistry::get().add(groupName + "/" + name)) {}
+
+  int64_t increment(int64_t value = 1) {
+    return value_->reset(value);
+  }
+
+  template <typename T, typename Unused1, typename... Unused>
+  int64_t increment(T value, Unused1, Unused...) {
+    return increment(value);
   }
 };
 
@@ -251,7 +304,7 @@ template <class T>
 _ScopeGuard<T> ScopeGuard(T f) {
   return _ScopeGuard<T>(f);
 }
-}
+} // namespace detail
 
 #define CAFFE_STAT_CTOR(ClassName)                 \
   ClassName(std::string name) : groupName(name) {} \
@@ -267,6 +320,11 @@ _ScopeGuard<T> ScopeGuard(T f) {
     groupName, #name                  \
   }
 
+#define CAFFE_STDDEV_EXPORTED_STAT(name) \
+  StdDevExportedStat name {              \
+    groupName, #name                     \
+  }
+
 #define CAFFE_DETAILED_EXPORTED_STAT(name) \
   DetailedExportedStat name {              \
     groupName, #name                       \
@@ -275,6 +333,11 @@ _ScopeGuard<T> ScopeGuard(T f) {
 #define CAFFE_STAT(name) \
   Stat name {            \
     groupName, #name     \
+  }
+
+#define CAFFE_STATIC_STAT(name) \
+  StaticStat name {             \
+    groupName, #name            \
   }
 
 #define CAFFE_EVENT(stats, field, ...)                              \
@@ -291,4 +354,4 @@ _ScopeGuard<T> ScopeGuard(T f) {
   if (auto g = detail::ScopeGuard([&](int64_t nanos) {   \
         CAFFE_EVENT(stats, field, nanos, ##__VA_ARGS__); \
       }))
-}
+} // namespace caffe2

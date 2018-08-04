@@ -32,6 +32,21 @@ class SequenceMaskOp final : public Operator<Context> {
             -1.0f * std::numeric_limits<float>::infinity())) {
     // Mode argument is required
     mode_ = GetArgument(operator_def, "mode").s();
+    // batch argument is optional, but if not given, we don't want a default val
+    if (HasArgument("batch")) {
+      batch_ = GetArgument(operator_def, "batch").i();
+    }
+
+    if (HasArgument("repeat_from_axis")) {
+      CAFFE_ENFORCE(
+          mode_ == "sequence",
+          "repeat_from_axis currently only supported in sequence mode.");
+      CAFFE_ENFORCE(
+          !HasArgument("batch"),
+          "repeat_from_axis and batch not currently supported together.");
+      repeat_from_ =
+          OperatorBase::GetSingleArgument<int>("repeat_from_axis", -1);
+    }
   }
 
   bool RunOnDevice() override;
@@ -45,8 +60,10 @@ class SequenceMaskOp final : public Operator<Context> {
   std::string mode_;
   bool grad_;
   float fill_val_;
+  int batch_;
+  int repeat_from_;
 };
 
-} // caffe2
+} // namespace caffe2
 
 #endif

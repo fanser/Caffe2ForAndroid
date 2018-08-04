@@ -9,8 +9,9 @@
 
 #include "caffe2/core/blob_serializer_base.h"
 #include "caffe2/core/common.h"
-#include "caffe2/core/typeid.h"
 #include "caffe2/core/logging.h"
+#include "caffe2/core/tensor.h"
+#include "caffe2/core/typeid.h"
 #include "caffe2/proto/caffe2.pb.h"
 
 namespace caffe2 {
@@ -24,6 +25,8 @@ namespace caffe2 {
  */
 class Blob {
  public:
+  typedef void (*DestroyCall)(void*);
+
   /**
    * Initializes an empty Blob.
    */
@@ -40,6 +43,9 @@ class Blob {
   }
 
   Blob& operator=(Blob&& other) noexcept {
+    if (pointer_ && destroy_) {
+      destroy_(pointer_);
+    }
     meta_ = std::move(other.meta_);
     pointer_ = std::move(other.pointer_);
     destroy_ = std::move(other.destroy_);
@@ -55,6 +61,20 @@ class Blob {
   template <class T>
   bool IsType() const { return meta_.Match<T>(); }
 
+  // TODO(jerryzh): Remove template
+  template <class T>
+  bool IsType(DeviceType device_type) const {
+    static_assert(
+        std::is_same<T, Tensor>::value,
+        "IsType(DeviceType) only available on "
+        "Tensor types.");
+    auto* tensor = static_cast<Tensor*>(pointer_);
+    if (tensor && tensor->GetDeviceType() == device_type) {
+      return true;
+    }
+    return false;
+  }
+
   /**
    * Returns the meta info of the blob.
    */
@@ -69,11 +89,15 @@ class Blob {
    * @brief Gets the const reference of the stored object. The code checks if
    * the stored object is of the desired type.
    */
+  // TODO(jerryzh): add a Get(DeviceType) function?
   template <class T>
   const T& Get() const {
-    CAFFE_ENFORCE(IsType<T>(),
+    CAFFE_ENFORCE(
+        IsType<T>(),
         "wrong type for the Blob instance. Blob contains ",
-        meta_.name(), " while caller expects ", TypeMeta::Name<T>());
+        meta_.name(),
+        " while caller expects ",
+        TypeMeta::TypeName<T>());
     return *static_cast<const T*>(pointer_);
   }
 
@@ -93,14 +117,36 @@ class Blob {
    * Reset().
    */
   template <class T>
-  T* GetMutable(bool* is_new_object=nullptr) {
+  T* GetMutable() {
+    static_assert(
+        std::is_default_constructible<T>::value,
+        "GetMutable can't be called with non-default-constructible types. "
+        "Try using specialized methods");
     if (IsType<T>()) {
-      if (is_new_object) *is_new_object = false;
       return static_cast<T*>(pointer_);
     } else {
-      if (is_new_object) *is_new_object = true;
-      VLOG(1) << "Create new mutable object " << TypeMeta::Name<T>();
+      VLOG(1) << "Create new mutable object " << TypeMeta::TypeName<T>();
       return Reset<T>(new T());
+    }
+  }
+
+  template <class T>
+  T* GetMutableOrNull() {
+    if (IsType<T>()) {
+      return static_cast<T*>(pointer_);
+    } else {
+      return nullptr;
+    }
+  }
+
+  inline Tensor* GetMutableTensor(DeviceType device_type) {
+    if (IsType<Tensor>() &&
+        static_cast<Tensor*>(pointer_)->GetDeviceType() == device_type) {
+      return static_cast<Tensor*>(pointer_);
+    } else {
+      VLOG(1) << "Create new mutable object " << TypeMeta::TypeName<Tensor>()
+              << " DeviceType:" << device_type;
+      return Reset<Tensor>(new Tensor(device_type));
     }
   }
 
@@ -121,6 +167,27 @@ class Blob {
     pointer_ = static_cast<void*>(allocated);
     destroy_ = &Destroy<T>;
     return allocated;
+  }
+
+  inline void*
+  Reset(void* allocated, const TypeMeta& meta, const DestroyCall& destroy) {
+    if (pointer_ && destroy_) {
+      destroy_(pointer_);
+    }
+    meta_ = meta;
+    pointer_ = static_cast<void*>(allocated);
+    destroy_ = destroy;
+    return allocated;
+  }
+
+  /**
+   * Releases the ownership, if any, this Blob has on the underlying pointer.
+   * The user is then responsible for freeing the data if needed
+   */
+  inline DestroyCall Release() {
+    DestroyCall d = destroy_;
+    destroy_ = nullptr;
+    return d;
   }
 
   /**
@@ -212,7 +279,6 @@ class Blob {
   static void Destroy(void* pointer) {
     delete static_cast<T*>(pointer);
   }
-  typedef void (*DestroyCall)(void *);
   TypeMeta meta_;
   void* pointer_ = nullptr;
   DestroyCall destroy_ = nullptr;

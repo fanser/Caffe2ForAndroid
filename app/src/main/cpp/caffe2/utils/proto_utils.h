@@ -8,6 +8,7 @@
 #endif  // !CAFFE2_USE_LITE_PROTO
 
 #include "caffe2/core/logging.h"
+#include "caffe2/utils/proto_wrap.h"
 #include "caffe2/proto/caffe2.pb.h"
 
 namespace caffe2 {
@@ -23,6 +24,8 @@ using ::google::protobuf::MessageLite;
 // protobuf-full, and some platforms (like mobile) may want to use
 // protobuf-lite instead.
 std::string DeviceTypeName(const int32_t& d);
+
+int DeviceId(const DeviceOption& option);
 
 // Returns if the two DeviceOptions are pointing to the same device.
 bool IsSameDevice(const DeviceOption& lhs, const DeviceOption& rhs);
@@ -45,9 +48,17 @@ inline void WriteProtoToBinaryFile(const MessageLite& proto,
 
 #ifdef CAFFE2_USE_LITE_PROTO
 
-inline string ProtoDebugString(const MessageLite& proto) {
-  return proto.SerializeAsString();
+namespace TextFormat {
+inline bool ParseFromString(const string& spec, MessageLite* proto) {
+  LOG(FATAL) << "If you are running lite version, you should not be "
+             << "calling any text-format protobuffers.";
 }
+} // namespace TextFormat
+
+
+string ProtoDebugString(const MessageLite& proto);
+
+bool ParseProtoFromLargeString(const string& str, MessageLite* proto);
 
 // Text format MessageLite wrappers: these functions do nothing but just
 // allowing things to compile. It will produce a runtime error if you are using
@@ -87,9 +98,13 @@ inline bool ReadProtoFromFile(const string& filename, MessageLite* proto) {
 
 using ::google::protobuf::Message;
 
-inline string ProtoDebugString(const Message& proto) {
-  return proto.ShortDebugString();
-}
+namespace TextFormat {
+bool ParseFromString(const string& spec, Message* proto);
+} // namespace TextFormat
+
+string ProtoDebugString(const Message& proto);
+
+bool ParseProtoFromLargeString(const string& str, Message* proto);
 
 bool ReadProtoFromTextFile(const char* filename, Message* proto);
 inline bool ReadProtoFromTextFile(const string filename, Message* proto) {
@@ -219,6 +234,18 @@ class ArgumentHelper {
     return ArgumentHelper(def).GetRepeatedMessageArgument<MessageType>(name);
   }
 
+  template <typename Def>
+  static bool RemoveArgument(Def& def, int index) {
+    if (index >= def.arg_size()) {
+      return false;
+    }
+    if (index < def.arg_size() - 1) {
+      def.mutable_arg()->SwapElements(index, def.arg_size() - 1);
+    }
+    def.mutable_arg()->RemoveLast();
+    return true;
+  }
+
   explicit ArgumentHelper(const OperatorDef& def);
   explicit ArgumentHelper(const NetDef& netdef);
   bool HasArgument(const string& name) const;
@@ -262,11 +289,24 @@ class ArgumentHelper {
   CaffeMap<string, Argument> arg_map_;
 };
 
+// **** Arguments Utils *****
+
+// Helper methods to get an argument from OperatorDef or NetDef given argument
+// name. Throws if argument does not exist.
 const Argument& GetArgument(const OperatorDef& def, const string& name);
+const Argument& GetArgument(const NetDef& def, const string& name);
+
+// Helper methods to query a boolean argument flag from OperatorDef or NetDef
+// given argument name. If argument does not exist, return default value.
+// Throws if argument exists but the type is not boolean.
 bool GetFlagArgument(
     const OperatorDef& def,
     const string& name,
-    bool def_value = false);
+    bool default_value = false);
+bool GetFlagArgument(
+    const NetDef& def,
+    const string& name,
+    bool default_value = false);
 
 Argument* GetMutableArgument(
     const string& name,
@@ -280,7 +320,26 @@ template <typename T>
 inline void AddArgument(const string& name, const T& value, OperatorDef* def) {
   GetMutableArgument(name, true, def)->CopyFrom(MakeArgument(name, value));
 }
+// **** End Arguments Utils *****
 
-}  // namespace caffe2
+bool inline operator==(const DeviceOption& dl, const DeviceOption& dr) {
+  return IsSameDevice(dl, dr);
+}
 
-#endif  // CAFFE2_UTILS_PROTO_UTILS_H_
+
+} // namespace caffe2
+
+namespace std {
+template <>
+struct hash<caffe2::DeviceOption> {
+  typedef caffe2::DeviceOption argument_type;
+  typedef std::size_t result_type;
+  result_type operator()(argument_type const& device_option) const {
+    std::string serialized;
+    CAFFE_ENFORCE(device_option.SerializeToString(&serialized));
+    return std::hash<std::string>{}(serialized);
+  }
+};
+} // namespace std
+
+#endif // CAFFE2_UTILS_PROTO_UTILS_H_

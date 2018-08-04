@@ -1,4 +1,3 @@
-// Copyright 2004-present Facebook. All Rights Reserved.
 
 #ifndef CAFFE2_OPERATORS_PREPEND_DIM_OP_H_
 #define CAFFE2_OPERATORS_PREPEND_DIM_OP_H_
@@ -28,7 +27,8 @@ class PrependDimOp : public Operator<Context> {
     CAFFE_ENFORCE(input.ndim() > 0, "Input must be at least 1D.");
     CAFFE_ENFORCE(
         input.dim(0) % dim_size_ == 0,
-        "First dimension must be multiple of prepend_dim.");
+        "First dimension must be multiple of prepend_dim. Current first dimension: ",
+        input.dim(0));
 
     vector<int64_t> actual_new_shape(input.ndim() + 1);
     actual_new_shape[0] = dim_size_;
@@ -40,8 +40,9 @@ class PrependDimOp : public Operator<Context> {
 
     if (output != &input) {
       // If we are not doing in-place computation, a copy is needed.
-      context_.template CopyBytes<Context, Context>(
-          input.nbytes(),
+      context_.CopyItemsSameDevice(
+          input.meta(),
+          input.size(),
           input.raw_data(),
           output->raw_mutable_data(input.meta()));
     }
@@ -74,8 +75,9 @@ class MergeDimOp : public Operator<Context> {
 
     if (output != &input) {
       // If we are not doing in-place computation, a copy is needed.
-      context_.template CopyBytes<Context, Context>(
-          input.nbytes(),
+      context_.CopyItemsSameDevice(
+          input.meta(),
+          input.size(),
           input.raw_data(),
           output->raw_mutable_data(input.meta()));
     }

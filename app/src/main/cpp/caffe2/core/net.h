@@ -4,10 +4,10 @@
 #include <atomic>
 #include <climits>
 #include <cstddef>
-#include <thread>  // NOLINT
+#include <thread> // NOLINT
 #include <typeinfo>
-#include <vector>
 #include <unordered_map>
+#include <vector>
 
 #include "caffe2/core/blob.h"
 #include "caffe2/core/common.h"
@@ -19,6 +19,9 @@
 #include "caffe2/core/workspace.h"
 #include "caffe2/proto/caffe2.pb.h"
 #include "caffe2/utils/simple_queue.h"
+#include "caffe2/utils/thread_pool.h"
+
+CAFFE2_DECLARE_string(caffe2_override_executor);
 
 namespace caffe2 {
 
@@ -29,27 +32,36 @@ typedef std::function<std::unique_ptr<NetObserver>(NetBase*)>
 
 class OperatorBase;
 class Workspace;
+
 // Net is a thin struct that owns all the operators together with the operator
 // contexts.
-class NetBase {
+class NetBase : public Observable<NetBase> {
  public:
   NetBase(const std::shared_ptr<const NetDef>& net_def, Workspace* ws);
   virtual ~NetBase() noexcept {}
-  virtual bool RunAsync() = 0;
+
   virtual bool SupportsAsync() = 0;
   inline const vector<const Event*>& events() const {
     return events_;
   }
 
-  inline bool Run() {
-    if (!RunAsync()) {
-      return false;
-    }
-    for (const Event* event : events_) {
+  virtual void Wait() {
+    // by default just wait till all events are finished
+    for (const auto& event : events_) {
       event->Finish();
     }
-    return true;
   }
+
+  virtual bool Run() {
+    if (!RunAsync()) {
+      LOG(ERROR) << "Failed to execute async run";
+      return false;
+    }
+    Wait();
+    return handleRunError();
+  }
+
+  virtual bool RunAsync();
 
   /**
    * Benchmarks a network.
@@ -63,10 +75,7 @@ class NetBase {
   virtual vector<float> TEST_Benchmark(
       const int /*warmup_runs*/,
       const int /*main_runs*/,
-      const bool /*run_individual*/) {
-    LOG(ERROR) << "Benchmark not implemented for this net type.";
-    return vector<float>();
-  }
+      const bool /*run_individual*/);
 
   inline const vector<string>& external_output() const {
     return external_output_;
@@ -83,30 +92,46 @@ class NetBase {
    */
   virtual vector<OperatorBase*> GetOperators() const = 0;
 
-  void SetObserver(std::unique_ptr<NetObserver> observer) {
-    observer_ = std::move(observer);
-  }
-
-  void RemoveObserver() {
-    observer_ = nullptr;
-  }
-
-  NetObserver* GetObserver() {
-    return observer_.get();
-  }
-
   const string& Name() const {
     return name_;
   }
 
+  inline const NetDef& debug_def() const {
+    CAFFE_ENFORCE(has_debug_def(), "net_def was null!");
+    return *net_def_;
+  }
+
+  inline bool has_debug_def() const {
+    return net_def_ != nullptr;
+  }
+
  protected:
+  virtual bool DoRunAsync() {
+    CAFFE_THROW("Not implemented");
+  };
+
+  virtual bool handleRunError() {
+    for (const Event* event : events_) {
+      if (event->Query() != EventStatus::EVENT_SUCCESS) {
+        CAFFE_THROW(event->ErrorMessage());
+      }
+    }
+    return true;
+  }
+
   vector<string> external_input_;
   vector<string> external_output_;
   string name_;
-  std::unique_ptr<NetObserver> observer_;
   vector<const Event*> events_;
-
+  std::shared_ptr<const NetDef> net_def_;
   DISABLE_COPY_AND_ASSIGN(NetBase);
+};
+
+class ExecutorHelper {
+ public:
+  ExecutorHelper() {}
+  virtual TaskThreadPool* GetPool(const DeviceOption& option) const;
+  virtual ~ExecutorHelper() {}
 };
 
 CAFFE_DECLARE_REGISTRY(
@@ -131,8 +156,10 @@ unique_ptr<NetBase> CreateNet(
     const std::shared_ptr<const NetDef>& net_def,
     Workspace* ws);
 
-void SetGlobalNetObserverCreator(NetObserverCreator creator);
+void AddGlobalNetObserverCreator(NetObserverCreator creator);
 
-}  // namespace caffe2
+void ClearGlobalNetObservers();
 
-#endif  // CAFFE2_CORE_NET_H_
+} // namespace caffe2
+
+#endif // CAFFE2_CORE_NET_H_

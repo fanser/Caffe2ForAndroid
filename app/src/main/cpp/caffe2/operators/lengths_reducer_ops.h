@@ -10,7 +10,10 @@ template <
     typename T, // output type
     class InputTypes, // supported input types, such as TensorTypes<float>
     bool USE_WEIGHT = 0, // Whether it is SparseLengthsWeightedSum
-    bool USE_MEAN = 0 // Whether this is SparseLengthsMean
+    bool USE_MEAN = 0, // Whether this is SparseLengthsMean
+    bool USE_POSITIONAL_WEIGHT = 0
+    // USE_WEIGHT = 1 and USE_POSITIONAL_WEIGHT = 1
+    // -> SparseLengthsPositionalWeightedSum
     >
 class CPUSparseLengthsReductionOp : public Operator<CPUContext> {
  public:
@@ -60,18 +63,21 @@ class CPUSparseLengthsReductionOp : public Operator<CPUContext> {
     const int* lengths = lengthsInput.template data<int>();
     const T* in_weight = nullptr;
 
-    if (USE_WEIGHT) { // static if
+    if (USE_WEIGHT) {
+      // static if
       auto& weightInput = Input(WEIGHT);
       CAFFE_ENFORCE_EQ(1, weightInput.ndim(), "WEIGHT must be a vector");
-      CAFFE_ENFORCE_EQ(
-          weightInput.size(),
-          indices_size,
-          "Weight should have the same length as indices.");
+      if (!USE_POSITIONAL_WEIGHT) {
+        CAFFE_ENFORCE_EQ(
+            weightInput.size(),
+            indices_size,
+            "Weight should have the same length as indices.");
+      }
       in_weight = weightInput.template data<T>();
     }
 
     // delegate work to perfkernel that branches based on architecture
-    EmbeddingLookup(
+    EmbeddingLookup<IndexType, InputType, T, USE_POSITIONAL_WEIGHT>(
         D,
         M,
         indices_size,
@@ -84,6 +90,22 @@ class CPUSparseLengthsReductionOp : public Operator<CPUContext> {
         USE_MEAN,
         out_data);
     return true;
+  }
+
+  std::vector<TensorFiller<CPUContext>> InputFillers(
+      const std::vector<std::vector<TIndex>>& shapes) override {
+    CAFFE_ENFORCE_EQ(shapes.size(), Operator<CPUContext>::Inputs().size());
+    auto fillers = Operator<CPUContext>::InputFillers(shapes);
+    if (USE_WEIGHT) {
+      // TODO: enable the fillers
+      throw UnsupportedOperatorFeature(
+          OperatorBase::type() + " does not have input fillers");
+    }
+    Operator<CPUContext>::SparseLengthsFillerHelper(
+        shapes, INDICES, LENGTHS, &fillers);
+    Operator<CPUContext>::SparseSegmentsFillerHelper(
+        shapes, DATA, INDICES, &fillers);
+    return fillers;
   }
 
  private:

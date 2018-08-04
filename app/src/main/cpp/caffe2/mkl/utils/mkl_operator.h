@@ -6,6 +6,8 @@
 #include "caffe2/mkl/utils/mkl_memory.h"
 #include "caffe2/proto/caffe2.pb.h"
 
+CAFFE2_DECLARE_bool(caffe2_mkl_memonger_in_use);
+
 namespace caffe2 {
 
 CAFFE_DECLARE_REGISTRY(
@@ -51,8 +53,7 @@ class MKLOperator : public OperatorBase {
     try {
       return RunOnDevice();
     } catch (EnforceNotMet& err) {
-      err.AppendMessage(
-          "Error from operator: \n" + ProtoDebugString(debug_def()));
+      err.AppendMessage(getErrorMsg());
       throw;
     }
   }
@@ -60,14 +61,21 @@ class MKLOperator : public OperatorBase {
   // Waits for a previous event. Note that to properly wait and run
   // asynchronously, WaitEvent, RunAsync and Record should all be executed
   // on the same CPU thread.
-  void WaitEvent(const Event& ev) final {
-    context_.SwitchToDevice();
+  void WaitEvent(const Event& ev, int /* unused */) final {
     context_.WaitEvent(ev);
   }
 
-  void Record() final {
-    context_.SwitchToDevice();
-    context_.Record(&event_);
+  void WaitEvents(const std::vector<const Event*>& events, int /* unused */)
+      final {
+    for (const auto& ev : events) {
+      context_.WaitEvent(*ev);
+    }
+  }
+
+  void RecordEvent(const char* err_msg = nullptr) final {
+    if (event_) {
+      context_.Record(event_.get(), err_msg);
+    }
   }
 
   virtual bool RunOnDevice() = 0;
@@ -77,6 +85,14 @@ class MKLOperator : public OperatorBase {
   }
 
  protected:
+  std::string getErrorMsg() {
+    if (has_debug_def()) {
+      return "Error from operator: " + ProtoDebugString(debug_def());
+    } else {
+      return "Error from operator: no op def";
+    }
+  }
+
   MKLContext context_;
   // The primitive used in the operator.
   PrimitiveWrapper<T> primitive_;

@@ -1,6 +1,7 @@
 #ifndef CAFFE2_OPERATORS_INDEX_HASH_OPS_H_
 #define CAFFE2_OPERATORS_INDEX_HASH_OPS_H_
 
+#include "caffe2/core/asan.h"
 #include "caffe2/core/logging.h"
 #include "caffe2/core/operator.h"
 
@@ -46,14 +47,16 @@ class IndexHashOp : public Operator<Context> {
 
  protected:
   template <typename T>
-  T hash(T id) {
+  CAFFE2_NO_SANITIZE("signed-integer-overflow") T hash(T id) {
     int8_t* bytes = (int8_t*)&id;
     T hashed = seed_ * 0xDEADBEEF;
     for (int i = 0; i < sizeof(T) / sizeof(int8_t); i++) {
       hashed = hashed * 65537 + bytes[i];
     }
-    hashed = (modulo_ + hashed % modulo_) % modulo_;
-    return hashed;
+    // We want the result of the modulo to be positive. This works under the
+    // assumption that modulo_ > 0 which is enforced in the constructor.
+    auto modHashed = hashed % modulo_;
+    return modHashed >= 0 ? modHashed : modHashed + modulo_;
   }
 
  private:

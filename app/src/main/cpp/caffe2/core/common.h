@@ -2,6 +2,7 @@
 #define CAFFE2_CORE_COMMON_H_
 
 #include <algorithm>
+#include <cmath>
 #include <map>
 #include <memory>
 #include <numeric>
@@ -64,8 +65,7 @@ using std::vector;
 // Disable the copy and assignment operator for a class. Note that this will
 // disable the usage of the class in std containers.
 #ifndef DISABLE_COPY_AND_ASSIGN
-#define DISABLE_COPY_AND_ASSIGN(classname)                              \
-private:                                                                       \
+#define DISABLE_COPY_AND_ASSIGN(classname)                                     \
   classname(const classname&) = delete;                                        \
   classname& operator=(const classname&) = delete
 #endif
@@ -107,6 +107,18 @@ private:                                                                       \
 #endif
 #endif
 
+// Defines CAFFE2_EXPORT and CAFFE2_IMPORT. On Windows, this corresponds to
+// different declarations (dllexport and dllimport). On Linux/Mac, it just
+// resolves to the same "default visibility" setting.
+#if defined(_MSC_VER)
+#if defined(CAFFE2_BUILD_SHARED_LIBS)
+#define CAFFE2_EXPORT __declspec(dllexport)
+#define CAFFE2_IMPORT __declspec(dllimport)
+#else
+#define CAFFE2_EXPORT
+#define CAFFE2_IMPORT
+#endif
+#else
 #if defined(__GNUC__)
 #if __GNUC_PREREQ(4, 9)
 #define CAFFE2_EXPORT [[gnu::visibility("default")]]
@@ -115,6 +127,34 @@ private:                                                                       \
 #endif
 #else
 #define CAFFE2_EXPORT
+#endif
+#define CAFFE2_IMPORT CAFFE2_EXPORT
+#endif
+
+// CAFFE2_API is a macro that, depends on whether you are building the
+// main caffe2 library or not, resolves to either CAFFE2_EXPORT or
+// CAFFE2_IMPORT.
+//
+// This is used in e.g. Caffe2's protobuf files: when building the main library,
+// it is defined as CAFFE2_EXPORT to fix a Windows global-variable-in-dll
+// issue, and for anyone dependent on Caffe2 it will be defined as
+// CAFFE2_IMPORT.
+
+#ifdef CAFFE2_BUILD_MAIN_LIB
+#define CAFFE2_API CAFFE2_EXPORT
+#else
+#define CAFFE2_API CAFFE2_IMPORT
+#endif
+
+#ifdef CAFFE2_BUILD_OBSERVER_LIB
+#define CAFFE2_OBSERVER_API CAFFE2_EXPORT
+#else
+#define CAFFE2_OBSERVER_API CAFFE2_IMPORT
+#endif
+
+
+#if defined(_MSC_VER)
+#define NOMINMAX
 #endif
 
 // make_unique is a C++14 feature. If we don't have 14, we will emulate
@@ -147,11 +187,11 @@ make_unique(Args&&...) = delete;
 
 #endif
 
-// to_string implementation for Android related stuff.
-#ifndef __ANDROID__
-using std::to_string;
-using std::stoi;
-#else
+// to_string, stoi and stod implementation for Android related stuff.
+// Note(jiayq): Do not use the CAFFE2_TESTONLY_FORCE_STD_STRING_TEST macro
+// outside testing code that lives under common_test.cc
+#if defined(__ANDROID__) || defined(CAFFE2_TESTONLY_FORCE_STD_STRING_TEST)
+#define CAFFE2_TESTONLY_WE_ARE_USING_CUSTOM_STRING_FUNCTIONS 1
 template <typename T>
 std::string to_string(T value)
 {
@@ -160,15 +200,40 @@ std::string to_string(T value)
   return os.str();
 }
 
-inline int stoi(const string& str)
-{
+inline int stoi(const string& str) {
   std::stringstream ss;
   int n = 0;
   ss << str;
   ss >> n;
   return n;
 }
-#endif
+
+inline double stod(const string& str, std::size_t* pos = 0) {
+  std::stringstream ss;
+  ss << str;
+  double val = 0;
+  ss >> val;
+  if (pos) {
+    if (ss.tellg() == std::streampos(-1)) {
+      *pos = str.size();
+    } else {
+      *pos = ss.tellg();
+    }
+  }
+  return val;
+}
+#else
+#define CAFFE2_TESTONLY_WE_ARE_USING_CUSTOM_STRING_FUNCTIONS 0
+using std::to_string;
+using std::stoi;
+using std::stod;
+#endif // defined(__ANDROID__) || defined(CAFFE2_FORCE_STD_STRING_FALLBACK_TEST)
+
+#if defined(__ANDROID__) && !defined(__NDK_MAJOR__)
+using ::round;
+#else
+using std::round;
+#endif // defined(__ANDROID__) && !defined(__NDK_MAJOR__)
 
 // dynamic cast reroute: if RTTI is disabled, go to reinterpret_cast
 template <typename Dst, typename Src>
@@ -192,7 +257,7 @@ class SkipIndices {
   }
   template <int First, int Second, int... Rest>
   static inline bool ContainsInternal(const int i) {
-    return (i == First) && ContainsInternal<Second, Rest...>(i);
+    return (i == First) || ContainsInternal<Second, Rest...>(i);
   }
 
  public:
@@ -209,18 +274,22 @@ class SkipIndices<> {
   }
 };
 
-// A global variable to mark if Caffe2 has cuda linked to the current runtime.
-// Do not directly use this variable, but instead use the HasCudaRuntime()
-// function below.
-extern bool g_caffe2_has_cuda_linked;
-
 // HasCudaRuntime() tells the program whether the binary has Cuda runtime
 // linked. This function should not be used in static initialization functions
 // as the underlying boolean variable is going to be switched on when one
 // loads libcaffe2_gpu.so.
-inline bool HasCudaRuntime() {
-  return g_caffe2_has_cuda_linked;
+bool HasCudaRuntime();
+bool HasHipRuntime();
+namespace internal {
+// Sets the Cuda Runtime flag that is used by HasCudaRuntime(). You should
+// never use this function - it is only used by the Caffe2 gpu code to notify
+// Caffe2 core that cuda runtime has been loaded.
+void SetCudaRuntimeFlag();
+void SetHipRuntimeFlag();
 }
+// Returns which setting Caffe2 was configured and built with (exported from
+// CMake)
+const std::map<string, string>& GetBuildOptions();
 
 }  // namespace caffe2
 

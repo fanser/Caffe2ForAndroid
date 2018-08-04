@@ -5,6 +5,7 @@
 #include <climits>
 #include <cstddef>
 #include <exception>
+#include <set>
 #include <typeinfo>
 #include <vector>
 
@@ -16,13 +17,18 @@
 #include "caffe2/core/operator_schema.h"
 #include "caffe2/core/registry.h"
 #include "caffe2/core/tensor.h"
+#include "caffe2/core/types.h"
 #include "caffe2/core/workspace.h"
 #include "caffe2/proto/caffe2.pb.h"
+#include "caffe2/utils/filler.h"
 #include "caffe2/utils/proto_utils.h"
 
 namespace caffe2 {
 
-class OperatorBase {
+class OperatorBase;
+typedef ObserverBase<OperatorBase> OperatorObserver;
+
+class OperatorBase : public Observable<OperatorBase> {
  public:
   explicit OperatorBase(const OperatorDef& operator_def, Workspace* ws);
   virtual ~OperatorBase() noexcept {}
@@ -73,9 +79,49 @@ class OperatorBase {
     }
   }
 
+  // TODO(jerryzh): Remove template
+  // and the type argument?
+  // This is to keep the API changes minimal and make refactoring
+  // a bit easier
+  template <typename T>
+  inline const T& Input(int idx, DeviceType type) {
+    static_assert(
+        std::is_same<T, Tensor>::value,
+        "Input(int, DeviceType) is only available for Tensor");
+    DCHECK_LT(idx, inputs_.size());
+    try {
+      // TODO(jerryzh): We'll need to check device type in Get<T>() later
+      // Get<T>() -> Get<T>(type)
+      const auto& tensor = inputs_.at(idx)->template Get<T>();
+      return tensor;
+    } catch (::caffe2::EnforceNotMet& enf) {
+      if (has_debug_def()) {
+        enf.AppendMessage(".\nOffending Blob name: ");
+        enf.AppendMessage(debug_def().input(idx));
+        enf.AppendMessage(".\n");
+      }
+      throw enf;
+    }
+  }
+
   template <typename T>
   inline T* Output(int idx) {
     return outputs_.at(idx)->template GetMutable<T>();
+  }
+
+  // TODO(jerryzh): Remove this template
+  template <typename T>
+  inline T* Output(int idx, DeviceType type) {
+    static_assert(
+        std::is_same<T, Tensor>::value,
+        "Output(int, DeviceType) is only available for Tensor");
+    return outputs_.at(idx)->GetMutableTensor(type);
+  }
+
+  template <typename T>
+  inline T* Output(int idx, T* allocated) {
+    outputs_.at(idx)->Reset(allocated);
+    return allocated;
   }
 
   inline const Blob& InputBlob(int idx) {
@@ -92,30 +138,72 @@ class OperatorBase {
   }
 
   template <typename T>
+  inline bool InputIsType(int idx, DeviceType device_type) {
+    static_assert(
+        std::is_same<T, Tensor>::value,
+        "InputIsType(idx, DeviceType) only available on "
+        "Tensor types.");
+    return inputs_.at(idx)->template IsType<T>(device_type);
+  }
+
+  template <typename T>
   inline bool OutputIsType(int idx) {
     return outputs_.at(idx)->template IsType<T>();
   }
 
-  inline int InputSize() { return inputs_.size(); }
-  inline int OutputSize() { return outputs_.size(); }
+  template <typename T>
+  inline bool OutputIsType(int idx, DeviceType type) {
+    static_assert(
+        std::is_same<T, Tensor>::value,
+        "OutputIsType(idx, DeviceType) only available on "
+        "Tensor types.");
+    return outputs_.at(idx)->template IsType<T>(type);
+  }
+
+  inline int InputSize() const {
+    return inputs_.size();
+  }
+  inline int OutputSize() const {
+    return outputs_.size();
+  }
   inline const vector<const Blob*>& Inputs() const { return inputs_; }
   inline const vector<Blob*>& Outputs() { return outputs_; }
-  vector<TensorShape> InputTensorShapes();
+  vector<TensorShape> InputTensorShapes() const;
 
-  virtual void WaitEvent(const Event& ev) {
-    CAFFE_NOT_IMPLEMENTED;
+  virtual void WaitEvent(const Event& ev, int /*stream_id */ = -1) {
+    ev.Finish();
   }
 
-  inline void Wait(const OperatorBase& other) {
-    WaitEvent(other.event());
+  inline void Wait(const OperatorBase& other, int stream_id = -1) {
+    if (!other.IsEventDisabled()) {
+      WaitEvent(other.event(), stream_id);
+    }
   }
 
-  virtual void Record() {
-    CAFFE_NOT_IMPLEMENTED;
+  virtual void WaitEvents(
+      const std::vector<const Event*>& events,
+      int /*stream_id*/ = -1) {
+    for (const auto& ev : events) {
+      ev->Finish();
+    }
+  }
+
+  virtual void Finish() {
+    if (event_) {
+      event_->Finish();
+    }
   }
 
   virtual bool Run(int /* unused */ /*stream_id*/ = 0) {
     CAFFE_NOT_IMPLEMENTED;
+  }
+
+  virtual bool HasAsyncPart() const {
+    return false;
+  }
+
+  virtual bool SupportsAsyncScheduling() const {
+    return false;
   }
 
   // RunAsync, if implemenented by the specific operators, will schedule the
@@ -123,7 +211,28 @@ class OperatorBase {
   // event_ member object. If the specific operator does not support RunAsync,
   // it will simply be synchronous as a fallback.
   virtual bool RunAsync(int stream_id = 0) {
-    return Run(stream_id);
+    try {
+      auto result = Run(stream_id);
+      if (result) {
+        if (HasAsyncPart()) {
+          RecordEvent();
+        } else {
+          SetEventFinished();
+        }
+      } else {
+        SetEventFinished(getErrorMsg().c_str());
+      }
+      return result;
+    } catch (EnforceNotMet& err) {
+      SetEventFinished(err.what());
+      throw;
+    } catch (const std::exception& err) {
+      SetEventFinished(err.what());
+      throw;
+    } catch (...) {
+      SetEventFinished(getErrorMsg().c_str());
+      throw;
+    }
   }
 
   virtual void AddRelatedBlobInfo(EnforceNotMet* err) {
@@ -133,7 +242,7 @@ class OperatorBase {
 
     bool found_input;
     if (err->caller() != nullptr) {
-      for (int i = 0; i < inputs_.size(); i++) {
+      for (size_t i = 0; i < inputs_.size(); i++) {
         if (inputs_[i]->GetRaw() == err->caller()) {
           found_input = true;
           err->AppendMessage(
@@ -141,7 +250,7 @@ class OperatorBase {
           break;
         }
       }
-      for (int i = 0; i < outputs_.size(); i++) {
+      for (size_t i = 0; i < outputs_.size(); i++) {
         if (outputs_[i]->GetRaw() == err->caller()) {
           if (found_input) {
             err->AppendMessage("\n OR ");
@@ -169,14 +278,6 @@ class OperatorBase {
   }
 
  public:
-  void SetObserver(std::unique_ptr<ObserverBase<OperatorBase>> observer) {
-    observer_ = std::move(observer);
-  }
-
-  void RemoveObserver() {
-    observer_ = nullptr;
-  }
-
   void RecordLastFailedOpNetPosition() {
     if (net_position_ != kNoNetPositionSet) {
       VLOG(1) << "Operator with id " << net_position_ << " failed";
@@ -194,43 +295,102 @@ class OperatorBase {
     net_position_ = idx;
   }
 
-  const DeviceOption& device_option() {
+  const DeviceOption& device_option() const {
     return device_option_;
   }
 
   const Event& event() const {
-    return event_;
+    CAFFE_ENFORCE(event_, "Event is disabled");
+    return *event_;
   }
 
-  const std::string& type() {
-    CAFFE_ENFORCE(operator_def_.get() != nullptr);
-    return operator_def_->type();
+  Event& event() {
+    CAFFE_ENFORCE(event_, "Event is disabled");
+    return *event_;
+  }
+
+  void ResetEvent() {
+    if (event_) {
+      event_->Reset();
+    }
+  }
+
+  void DisableEvent() {
+    event_ = nullptr;
+  }
+
+  bool IsEventDisabled() const {
+    return !event_;
+  }
+
+  virtual void SyncDevice() {
+    CAFFE_NOT_IMPLEMENTED;
+  }
+
+  // Checks whether stream is ready to execute new computation,
+  // used in stream allocation optimization to skip stream that is currently
+  // busy. Depends on context and operator's device, returns true by default
+  virtual bool IsStreamFree(int /* unused */) const {
+    return true;
+  }
+
+  const std::string& type() const {
+    return type_;
+  }
+
+  void annotate_engine(const std::string& engine) {
+    engine_ = engine;
+  }
+
+  const std::string& engine() const {
+    return engine_;
+  }
+
+  void SetExecutorHelper(ExecutorHelper* helper) {
+    helper_ = helper;
+  }
+
+  ExecutorHelper* GetExecutorHelper() const {
+    return helper_;
   }
 
  public:
   static constexpr int kNoNetPositionSet = -1;
 
-  ObserverBase<OperatorBase>* GetObserver() {
-    return observer_.get();
-  }
-
-  const ObserverBase<OperatorBase>* GetObserver() const {
-    return observer_.get();
-  }
-
  private:
   Workspace* operator_ws_;
   std::shared_ptr<const OperatorDef> operator_def_;
   DeviceOption device_option_;
+  std::string engine_;
+  std::string type_;
   vector<const Blob*> inputs_;
   vector<Blob*> outputs_;
 
   int net_position_{kNoNetPositionSet};
 
+  ExecutorHelper* helper_ = nullptr;
+
  protected:
-  std::unique_ptr<ObserverBase<OperatorBase>> observer_;
+  virtual void RecordEvent(const char* /*err_msg*/ = nullptr) {
+    CAFFE_NOT_IMPLEMENTED;
+  }
+
+  void SetEventFinished(const char* err_msg = nullptr) {
+    if (event_) {
+      event_->SetFinished(err_msg);
+    }
+  }
+
+  std::string getErrorMsg() {
+    if (has_debug_def()) {
+      return "Error from operator: " + ProtoDebugString(debug_def());
+    } else {
+      return "Error from operator: no op def";
+    }
+  }
+
   // An event used by asynchronous execution.
-  Event event_;
+  std::unique_ptr<Event> event_;
 
   DISABLE_COPY_AND_ASSIGN(OperatorBase);
 };
@@ -262,7 +422,6 @@ class OperatorBase {
 #define OUTPUT_TAGS(first_input, ...)                                          \
   enum _OutputTags { first_input = 0, __VA_ARGS__ }
 
-
 // Operator is the class that you usually want to derive, if your operator will
 // run on different devices. You should then implement the RunOnDevice()
 // function.
@@ -270,47 +429,57 @@ template <class Context>
 class Operator : public OperatorBase {
  public:
   explicit Operator(const OperatorDef& operator_def, Workspace* ws)
-      : OperatorBase(operator_def, ws),
-        context_(operator_def.device_option()) {
+      : OperatorBase(operator_def, ws), context_(operator_def.device_option()) {
     // In the constructor, we switch to the device so that the child class
     // constructors will run on that device.
     context_.SwitchToDevice(0);
   }
   ~Operator() noexcept override {}
 
-  inline const Tensor<Context>& Input(int idx) {
-    return OperatorBase::template Input<Tensor<Context> >(idx); }
-  inline Tensor<Context>* Output(int idx) {
-    return OperatorBase::template Output<Tensor<Context>>(idx);
+  inline const Tensor& Input(
+      int idx,
+      DeviceType type = Context::GetDeviceType()) {
+    return OperatorBase::template Input<Tensor>(idx, type);
   }
 
-  void WaitEvent(const Event& ev) final {
-    context_.SwitchToDevice();
+  inline Tensor* Output(int idx, DeviceType type = Context::GetDeviceType()) {
+    return OperatorBase::template Output<Tensor>(idx, type);
+  }
+
+  void WaitEvent(const Event& ev, int stream_id = -1) final {
+    if (stream_id >= 0) {
+      context_.SwitchToDevice(stream_id);
+    }
     context_.WaitEvent(ev);
   }
 
-  void Record() final {
-    context_.SwitchToDevice();
-    context_.Record(&event_);
+  void WaitEvents(const std::vector<const Event*>& events, int stream_id = -1)
+      final {
+    if (stream_id >= 0) {
+      context_.SwitchToDevice(stream_id);
+    }
+    for (const auto& ev : events) {
+      context_.WaitEvent(*ev);
+    }
   }
 
   // The run function of Operator switches to the device, and then carries out
   // the actual computation with RunOnDevice(). You should implement RunOnDevice
   // instead of Run().
+  // Note: Run does not update operator's event and can be used only with
+  // non-async executors that do not rely on events
   bool Run(int stream_id = 0) final {
     try {
-      if (observer_) {
-        observer_->Start();
-      }
+      StartAllObservers();
+
       context_.SwitchToDevice(stream_id);
       bool result = RunOnDevice();
       if (!result) {
         this->RecordLastFailedOpNetPosition();
       }
       context_.FinishDeviceComputation(); // throws on error
-      if (observer_) {
-        observer_->Stop();
-      }
+
+      StopAllObservers();
 
       return result;
     } catch (EnforceNotMet& err) {
@@ -320,21 +489,36 @@ class Operator : public OperatorBase {
         AddRelatedBlobInfo(&err);
       }
       this->RecordLastFailedOpNetPosition();
+      StopAllObservers();
       throw;
     } catch (...) {
       this->RecordLastFailedOpNetPosition();
+      StopAllObservers();
       throw;
     }
   }
 
   bool RunAsync(int stream_id = 0) final {
     try {
+      StartAllObservers();
+
       context_.SwitchToDevice(stream_id);
       auto result = RunOnDevice();
-      if (!result) {
+      if (result) {
+        if (HasAsyncPart()) {
+          RecordEvent();
+        } else {
+          // Manually set CPU operator's event status to finished,
+          // unless this is an async CPU operator
+          SetEventFinished();
+        }
+      } else {
+        SetEventFinished(getErrorMsg().c_str());
         this->RecordLastFailedOpNetPosition();
       }
-      context_.Record(&event_);
+
+      StopAllObservers();
+
       return result;
     } catch (EnforceNotMet& err) {
       if (has_debug_def()) {
@@ -342,17 +526,140 @@ class Operator : public OperatorBase {
             "Error from operator: \n" + ProtoDebugString(debug_def()));
         AddRelatedBlobInfo(&err);
       }
+      SetEventFinished(err.what());
       this->RecordLastFailedOpNetPosition();
+      StopAllObservers();
+      throw;
+    } catch (const std::exception& err) {
+      SetEventFinished(err.what());
+      this->RecordLastFailedOpNetPosition();
+      StopAllObservers();
       throw;
     } catch (...) {
+      SetEventFinished(getErrorMsg().c_str());
       this->RecordLastFailedOpNetPosition();
+      StopAllObservers();
       throw;
     }
   }
 
+  bool IsStreamFree(int stream_id) const override {
+    return context_.IsStreamFree(device_option(), stream_id);
+  }
+
   virtual bool RunOnDevice() = 0;
 
+  // Returns whether operator has async on device part.
+  // CUDA operators by default have async parts, CPU operators by default
+  // don't have async parts and are finished after RunOnDevice call.
+  // Events of operators that don't have async parts are automatically set
+  // to finished state by RunAsync.
+  // Defaulting to the value from context (true for CUDA, false for CPU).
+  // Override in case of async CPU operators
+  bool HasAsyncPart() const override {
+    return context_.HasAsyncPartDefault();
+  }
+
+  // Returns whether operator's RunOnDevice schedules async on device part and
+  // can be run without waiting for parent operator's async part to be finished
+  // on the same device.
+  // Note: when true, RunOnDevice must not access the content of the input blobs
+  // as they might not be computed yet
+  // Note: when true, operator's device needs to support async scheduling:
+  //  - supports concept of streams: async ops scheduled on the same stream are
+  //    guaranteed to be executed in the same order they were scheduled
+  //  - provides non-blocking cross device/cross stream synchronization
+  //    primitives
+  //
+  // By default, assuming an op with an async part can be scheduled
+  // asynchronously if device supports async scheduling
+  bool SupportsAsyncScheduling() const override {
+    return HasAsyncPart() && context_.SupportsAsyncScheduling();
+  }
+
+  const Context* getContext() const {
+    return &context_;
+  }
+
+  void SyncDevice() final {}
+
+  virtual std::vector<TensorFiller<Context>> InputFillers(
+      const std::vector<std::vector<TIndex>>& shapes) {
+    CAFFE_ENFORCE(shapes.size() == Inputs().size());
+    std::vector<TensorFiller<Context>> fillers;
+    for (const auto& shape : shapes) {
+      fillers.emplace_back(shape, &context_);
+    }
+
+    return fillers;
+  }
+
+#define DISABLE_INPUT_FILLERS(Context)                                 \
+  std::vector<TensorFiller<Context>> InputFillers(                     \
+      const std::vector<std::vector<TIndex>>& /* unused */) override { \
+    throw UnsupportedOperatorFeature(                                  \
+        OperatorBase::type() + " does not have input fillers");        \
+  }
+
+  void SparseLengthsFillerHelper(
+      const std::vector<std::vector<TIndex>>& shapes,
+      size_t value_index,
+      size_t length_index,
+      std::vector<TensorFiller<Context>>* fillers) {
+    CAFFE_ENFORCE_EQ(shapes[length_index].size(), 1);
+    (*fillers)[length_index].SparseLengths(shapes[value_index].front());
+  }
+
+  void SparseSegmentsFillerHelper(
+      const std::vector<std::vector<TIndex>>& shapes,
+      size_t value_index,
+      size_t segment_index,
+      std::vector<TensorFiller<Context>>* fillers) {
+    CAFFE_ENFORCE_EQ(shapes[segment_index].size(), 1);
+    // TODO (mnaumov): distribution of value
+    (*fillers)[value_index].Min(0).Max(shapes[value_index].front() * 2);
+    (*fillers)[segment_index].SparseSegments(shapes[value_index].front() - 1);
+  }
+
+// The helper is build sparse input with values and lengths; e.g.:
+// values  = [1, 2, 3, 2, 4, 6, 7, 3, 6]
+//            \_____/  \________/  \__/
+// lengths =    [3,        4,       2]
+#define USE_VALUE_LENGTH_INPUT_FILLERS(Context, value_index, length_index) \
+  std::vector<TensorFiller<Context>> InputFillers(                         \
+      const std::vector<std::vector<TIndex>>& shapes) override {           \
+    CAFFE_ENFORCE_EQ(shapes.size(), Operator<Context>::Inputs().size());   \
+    auto fillers = Operator<Context>::InputFillers(shapes);                \
+    Operator<Context>::SparseLengthsFillerHelper(                          \
+        shapes, value_index, length_index, &fillers);                      \
+    return fillers;                                                        \
+  }
+
+  // The helper is build sparse input with values, keys, and lengths; e.g.:
+  // values  = [1, 2, 3, 2, 4, 6, 7, 3, 6]
+  // keys    = [0, 1, 4, 0, 1, 2, 5, 1, 2]
+  //            \_____/  \________/  \__/
+  // lengths =    [3,        4,       2]
+#define USE_VALUE_KEY_LENGTH_INPUT_FILLERS(                              \
+    Context, value_index, key_index, length_index)                       \
+  std::vector<TensorFiller<Context>> InputFillers(                       \
+      const std::vector<std::vector<TIndex>>& shapes) override {         \
+    CAFFE_ENFORCE_EQ(shapes.size(), Operator<Context>::Inputs().size()); \
+    auto fillers = Operator<Context>::InputFillers(shapes);              \
+    Operator<Context>::SparseLengthsFillerHelper(                        \
+        shapes, key_index, length_index, &fillers);                      \
+    Operator<Context>::SparseSegmentsFillerHelper(                       \
+        shapes, value_index, key_index, &fillers);                       \
+    return fillers;                                                      \
+  }
+
  protected:
+  void RecordEvent(const char* err_msg = nullptr) final {
+    if (event_) {
+      context_.Record(event_.get(), err_msg);
+    }
+  }
+
   Context context_;
 };
 
@@ -365,11 +672,13 @@ class Operator : public OperatorBase {
   /* using override */ using OperatorBase::InputSize;               \
   /* using override */ using OperatorBase::OutputSize
 
-#define USE_OPERATOR_FUNCTIONS(context)                   \
-  USE_OPERATOR_BASE_FUNCTIONS;                            \
-  /* using override */ using Operator<context>::context_; \
-  /* using override */ using Operator<context>::Input;    \
-  /* using override */ using Operator<context>::Output
+#define USE_OPERATOR_FUNCTIONS(context)                    \
+  USE_OPERATOR_BASE_FUNCTIONS;                             \
+  /* using override */ using Operator<context>::context_;  \
+  /* using override */ using Operator<context>::Input;     \
+  /* using override */ using Operator<context>::InputBlob; \
+  /* using override */ using Operator<context>::Output;    \
+  /* using override */ using Operator<context>::OutputBlob
 
 #define USE_OPERATOR_CONTEXT_FUNCTIONS USE_OPERATOR_FUNCTIONS(Context)
 
@@ -466,8 +775,8 @@ struct DispatchHelper<FixedValues<>, ExtraArgs...> {
       return DispatchHelper<TensorTypes<Types...>, ExtraArgs...>::             \
           template call<Op>(op, meta);                                         \
     }                                                                          \
-    template <typename Op, typename Context>                                   \
-    static bool call(Op* op, const Tensor<Context>& tensor) {                  \
+    template <typename Op>                                                     \
+    static bool call(Op* op, const Tensor& tensor) {                           \
       return call<Op>(op, tensor.meta());                                      \
     }                                                                          \
     template <typename Op>                                                     \
@@ -482,8 +791,8 @@ struct DispatchHelper<FixedValues<>, ExtraArgs...> {
     static bool call(Op* /* unused */, const TypeMeta& meta) {                 \
       CAFFE_THROW("Unsupported type of tensor: ", meta.name());                \
     }                                                                          \
-    template <typename Op, typename Context>                                   \
-    static bool call(Op* op, const Tensor<Context>& tensor) {                  \
+    template <typename Op>                                                     \
+    static bool call(Op* op, const Tensor& tensor) {                           \
       return call<Op>(op, tensor.meta());                                      \
     }                                                                          \
     template <typename Op>                                                     \
@@ -500,8 +809,8 @@ struct DispatchHelper<FixedValues<>, ExtraArgs...> {
     static bool call(Op* op, const TypeMeta&) {                                \
       return op->template DoRunWithOtherType<ExtraArgs...>();                  \
     }                                                                          \
-    template <typename Op, typename Context>                                   \
-    static bool call(Op* op, const Tensor<Context>& tensor) {                  \
+    template <typename Op>                                                     \
+    static bool call(Op* op, const Tensor& tensor) {                           \
       return call<Op>(op, tensor.meta());                                      \
     }                                                                          \
     template <typename Op>                                                     \
@@ -524,10 +833,17 @@ CAFFE2_DEFINE_TENSOR_TYPES_DISPATCHER(
 //     registry function.
 // (2) Then, one can call the operator registry function to further create the
 //     operators.
-typedef Registry<std::string, OperatorBase, const OperatorDef&, Workspace*>
+typedef Registry<
+    std::string,
+    std::unique_ptr<OperatorBase>,
+    const OperatorDef&,
+    Workspace*>
     OperatorRegistry;
-typedef Registry<std::string, OperatorBase, const OperatorDef&, Workspace*>* (
-    *RegistryFunction)();
+typedef Registry<
+    std::string,
+    std::unique_ptr<OperatorBase>,
+    const OperatorDef&,
+    Workspace*>* (*RegistryFunction)();
 std::map<int32_t, OperatorRegistry*>* gDeviceTypeRegistry();
 
 struct DeviceTypeRegisterer {
@@ -599,6 +915,30 @@ CAFFE_DECLARE_REGISTRY(
 #define REGISTER_CUDNN_OPERATOR(name, ...) \
   REGISTER_CUDA_OPERATOR_WITH_ENGINE(name, CUDNN, __VA_ARGS__)
 
+// Macros for HIP operators
+CAFFE_DECLARE_REGISTRY(
+    HIPOperatorRegistry,
+    OperatorBase,
+    const OperatorDef&,
+    Workspace*);
+#define REGISTER_HIP_OPERATOR_CREATOR(key, ...) \
+  CAFFE_REGISTER_CREATOR(HIPOperatorRegistry, key, __VA_ARGS__)
+#define REGISTER_HIP_OPERATOR(name, ...)                           \
+  extern void CAFFE2_PLEASE_ADD_OPERATOR_SCHEMA_FOR_##name();       \
+  static void CAFFE2_UNUSED CAFFE_ANONYMOUS_VARIABLE_HIP##name() { \
+    CAFFE2_PLEASE_ADD_OPERATOR_SCHEMA_FOR_##name();                 \
+  }                                                                 \
+  CAFFE_REGISTER_CLASS(HIPOperatorRegistry, name, __VA_ARGS__)
+#define REGISTER_HIP_OPERATOR_STR(str_name, ...) \
+  CAFFE_REGISTER_TYPED_CLASS(HIPOperatorRegistry, str_name, __VA_ARGS__)
+
+#define REGISTER_HIP_OPERATOR_WITH_ENGINE(name, engine, ...) \
+  CAFFE_REGISTER_CLASS(                                       \
+      HIPOperatorRegistry, name##_ENGINE_##engine, __VA_ARGS__)
+
+#define REGISTER_MIOPEN_OPERATOR(name, ...) \
+  REGISTER_HIP_OPERATOR_WITH_ENGINE(name, MIOPEN, __VA_ARGS__)
+
 // StaticLinkingProtector is a helper class that ensures that the Caffe2
 // library is linked correctly with whole archives (in the case of static
 // linking). What happens is that when CreateOperator is called for the first
@@ -656,6 +996,10 @@ unique_ptr<OperatorBase> CreateOperator(
     Workspace* ws,
     int net_position = OperatorBase::kNoNetPositionSet);
 
+const std::string OpRegistryKey(
+    const std::string& op_type,
+    const std::string& engine = "");
+
 // User can set the preferred engines as a list of engine names, in
 // descending order of preference.
 using EnginePrefType = std::vector<std::string>;
@@ -673,17 +1017,31 @@ void SetOpEnginePref(
     const std::string& op_type,
     const CaffeMap<int, EnginePrefType>& op_pref);
 
+TensorShape GetTensorShapeOfBlob(const Blob* b);
+
+TensorShapes InferBlobShapesAndTypes(
+    CaffeMap<string, TensorShape>& blob_desc,
+    const vector<NetDef*>& nets);
+
 TensorShapes InferBlobShapesAndTypesFromWorkspace(
     Workspace* ws,
-    const vector<std::unique_ptr<NetDef>>& nets);
+    const vector<NetDef*>& nets);
 
 TensorShapes InferBlobShapesAndTypesFromMap(
     const CaffeMap<std::string, std::vector<TIndex>>& blob_dimensions,
-    const vector<std::unique_ptr<NetDef>>& nets);
+    const vector<NetDef*>& nets);
+
+TensorShapes InferBlobShapesAndTypesFromMap(
+    const CaffeMap<std::string, std::vector<TIndex>>& blob_dimensions,
+    const CaffeMap<std::string, TensorProto_DataType>& blob_types,
+    const vector<NetDef*>& nets);
 
 std::map<string, std::pair<DeviceOption, DeviceOption>> ValidateTensorDevices(
     OperatorBase& op,
     const OperatorDef& op_def);
+
+// Get a set of registered operator names
+std::set<std::string> GetRegisteredOperators();
 
 }  // namespace caffe2
 

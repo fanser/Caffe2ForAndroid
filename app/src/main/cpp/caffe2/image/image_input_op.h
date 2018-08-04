@@ -1,4 +1,3 @@
-// Copyright 2004-present Facebook. All Rights Reserved.
 
 #ifndef CAFFE2_IMAGE_IMAGE_INPUT_OP_H_
 #define CAFFE2_IMAGE_IMAGE_INPUT_OP_H_
@@ -8,6 +7,7 @@
 #include <iostream>
 #include <algorithm>
 
+#include "caffe2/core/common.h"
 #include "caffe/proto/caffe.pb.h"
 #include "caffe2/core/db.h"
 #include "caffe2/utils/cast.h"
@@ -28,11 +28,13 @@ class ImageInputOp final
   // MULTI_LABEL_DENSE: dense label embedding vector for label embedding regression
   // MULTI_LABEL_WEIGHTED_SPARSE: sparse active label indices with per-label weights
   // for multi-label classification
+  // SINGLE_LABEL_WEIGHTED: single integer label for multi-class classification with weighted sampling
   enum LABEL_TYPE {
     SINGLE_LABEL = 0,
     MULTI_LABEL_SPARSE = 1,
     MULTI_LABEL_DENSE = 2,
-    MULTI_LABEL_WEIGHTED_SPARSE = 3
+    MULTI_LABEL_WEIGHTED_SPARSE = 3,
+    SINGLE_LABEL_WEIGHTED = 4
   };
 
   // INCEPTION_STYLE: Random crop with size 8% - 100% image area and aspect
@@ -85,12 +87,12 @@ class ImageInputOp final
   unique_ptr<db::DBReader> owned_reader_;
   const db::DBReader* reader_;
   CPUContext cpu_context_;
-  TensorCPU prefetched_image_;
-  TensorCPU prefetched_label_;
+  Tensor prefetched_image_{CPU};
+  Tensor prefetched_label_{CPU};
   vector<TensorCPU> prefetched_additional_outputs_;
-  Tensor<Context> prefetched_image_on_device_;
-  Tensor<Context> prefetched_label_on_device_;
-  vector<Tensor<Context>> prefetched_additional_outputs_on_device_;
+  Tensor prefetched_image_on_device_{Context::GetDeviceType()};
+  Tensor prefetched_label_on_device_{Context::GetDeviceType()};
+  vector<Tensor> prefetched_additional_outputs_on_device_;
   // Default parameters for images
   PerImageArg default_arg_;
   int batch_size_;
@@ -116,8 +118,8 @@ class ImageInputOp final
   int crop_;
   std::vector<float> mean_;
   std::vector<float> std_;
-  Tensor<Context> mean_gpu_;
-  Tensor<Context> std_gpu_;
+  Tensor mean_gpu_{Context::GetDeviceType()};
+  Tensor std_gpu_{Context::GetDeviceType()};
   bool mirror_;
   bool is_test_;
   bool use_caffe_datum_;
@@ -137,9 +139,13 @@ class ImageInputOp final
   vector<int> random_scale_;
   bool random_scaling_;
 
-
   // Working variables
   std::vector<std::mt19937> randgen_per_thread_;
+
+  // number of exceptions produced by opencv while reading image data
+  std::atomic<long> num_decode_errors_in_batch_{0};
+  // opencv exceptions tolerance
+  float max_decode_error_ratio_;
 };
 
 template <class Context>
@@ -148,8 +154,6 @@ ImageInputOp<Context>::ImageInputOp(
     Workspace* ws)
     : PrefetchOperator<Context>(operator_def, ws),
       reader_(nullptr),
-      prefetched_additional_outputs_(OutputSize() - 2),
-      prefetched_additional_outputs_on_device_(OutputSize() - 2),
       batch_size_(
           OperatorBase::template GetSingleArgument<int>("batch_size", 0)),
       label_type_(static_cast<LABEL_TYPE>(
@@ -195,8 +199,12 @@ ImageInputOp<Context>::ImageInputOp(
       // output type only supported with CUDA and use_gpu_transform for now
       output_type_(
           cast::GetCastDataType(ArgumentHelper(operator_def), "output_type")),
-      random_scale_(
-          OperatorBase::template GetRepeatedArgument<int>("random_scale", {-1,-1})) {
+      random_scale_(OperatorBase::template GetRepeatedArgument<int>(
+          "random_scale",
+          {-1, -1})),
+      max_decode_error_ratio_(OperatorBase::template GetSingleArgument<float>(
+          "max_decode_error_ratio",
+          1.0)) {
   if ((random_scale_[0] == -1) || (random_scale_[1] == -1)) {
     random_scaling_ = false;
   } else {
@@ -251,14 +259,15 @@ ImageInputOp<Context>::ImageInputOp(
 
   CAFFE_ENFORCE_GT(batch_size_, 0, "Batch size should be nonnegative.");
   if (use_caffe_datum_) {
-    CAFFE_ENFORCE_EQ(label_type_, SINGLE_LABEL,
+    CAFFE_ENFORCE(label_type_ == SINGLE_LABEL || label_type_ == SINGLE_LABEL_WEIGHTED,
       "Caffe datum only supports single integer label");
   }
-  if (label_type_ !=  SINGLE_LABEL) {
+  if (label_type_ !=  SINGLE_LABEL && label_type_ != SINGLE_LABEL_WEIGHTED) {
     CAFFE_ENFORCE_GT(num_labels_, 0,
       "Number of labels must be set for using either sparse label indices or dense label embedding.");
   }
-  if (label_type_ == MULTI_LABEL_WEIGHTED_SPARSE) {
+  if (label_type_ == MULTI_LABEL_WEIGHTED_SPARSE ||
+    label_type_ == SINGLE_LABEL_WEIGHTED) {
     additional_inputs_offset_ = 3;
   } else {
     additional_inputs_offset_ = 2;
@@ -367,13 +376,16 @@ ImageInputOp<Context>::ImageInputOp(
       TIndex(crop_),
       TIndex(crop_),
       TIndex(color_ ? 3 : 1));
-  if (label_type_ != SINGLE_LABEL) {
+  if (label_type_ != SINGLE_LABEL && label_type_ != SINGLE_LABEL_WEIGHTED) {
     prefetched_label_.Resize(TIndex(batch_size_), TIndex(num_labels_));
   } else {
     prefetched_label_.Resize(vector<TIndex>(1, batch_size_));
   }
 
   for (int i = 0; i < additional_output_sizes.size(); ++i) {
+    prefetched_additional_outputs_on_device_.emplace_back(
+        Context::GetDeviceType());
+    prefetched_additional_outputs_.emplace_back(CPU);
     prefetched_additional_outputs_[i].Resize(
         TIndex(batch_size_), TIndex(additional_output_sizes[i]));
   }
@@ -445,13 +457,23 @@ bool ImageInputOp<Context>::GetImageAndLabelAndInfoFromDBValue(
     prefetched_label_.mutable_data<int>()[item_id] = datum.label();
     if (datum.encoded()) {
       // encoded image in datum.
-      src = cv::imdecode(
-          cv::Mat(
-              1,
-              datum.data().size(),
-              CV_8UC1,
-              const_cast<char*>(datum.data().data())),
-          color_ ? CV_LOAD_IMAGE_COLOR : CV_LOAD_IMAGE_GRAYSCALE);
+      // count the number of exceptions from opencv imdecode
+      try {
+        src = cv::imdecode(
+            cv::Mat(
+                1,
+                datum.data().size(),
+                CV_8UC1,
+                const_cast<char*>(datum.data().data())),
+            color_ ? CV_LOAD_IMAGE_COLOR : CV_LOAD_IMAGE_GRAYSCALE);
+        if (src.rows == 0 or src.cols == 0) {
+          num_decode_errors_in_batch_++;
+          src = cv::Mat::zeros(cv::Size(224, 224), CV_8UC3);
+        }
+      } catch (cv::Exception& e) {
+        num_decode_errors_in_batch_++;
+        src = cv::Mat::zeros(cv::Size(224, 224), CV_8UC3);
+      }
     } else {
       // Raw image in datum.
       CAFFE_ENFORCE(datum.channels() == 3 || datum.channels() == 1);
@@ -484,6 +506,7 @@ bool ImageInputOp<Context>::GetImageAndLabelAndInfoFromDBValue(
     CAFFE_ENFORCE(protos.ParseFromString(value));
     const TensorProto& image_proto = protos.protos(0);
     const TensorProto& label_proto = protos.protos(1);
+    // add handle protos
     vector<TensorProto> additional_output_protos;
     int start = additional_inputs_offset_;
     int end = start + additional_inputs_count_;
@@ -509,13 +532,23 @@ bool ImageInputOp<Context>::GetImageAndLabelAndInfoFromDBValue(
       const string& encoded_image_str = image_proto.string_data(0);
       int encoded_size = encoded_image_str.size();
       // We use a cv::Mat to wrap the encoded str so we do not need a copy.
-      src = cv::imdecode(
-          cv::Mat(
-              1,
-              &encoded_size,
-              CV_8UC1,
-              const_cast<char*>(encoded_image_str.data())),
-          color_ ? CV_LOAD_IMAGE_COLOR : CV_LOAD_IMAGE_GRAYSCALE);
+      // count the number of exceptions from opencv imdecode
+      try {
+        src = cv::imdecode(
+            cv::Mat(
+                1,
+                &encoded_size,
+                CV_8UC1,
+                const_cast<char*>(encoded_image_str.data())),
+            color_ ? CV_LOAD_IMAGE_COLOR : CV_LOAD_IMAGE_GRAYSCALE);
+        if (src.rows == 0 or src.cols == 0) {
+          num_decode_errors_in_batch_++;
+          src = cv::Mat::zeros(cv::Size(224, 224), CV_8UC3);
+        }
+      } catch (cv::Exception& e) {
+        num_decode_errors_in_batch_++;
+        src = cv::Mat::zeros(cv::Size(224, 224), CV_8UC3);
+      }
     } else if (image_proto.data_type() == TensorProto::BYTE) {
       // raw image content.
       int src_c = (image_proto.dims_size() == 3) ? image_proto.dims(2) : 1;
@@ -533,8 +566,9 @@ bool ImageInputOp<Context>::GetImageAndLabelAndInfoFromDBValue(
       LOG(FATAL) << "Unknown image data type.";
     }
 
+    // TODO: if image decoding was unsuccessful, set label to 0
     if (label_proto.data_type() == TensorProto::FLOAT) {
-      if (label_type_ == SINGLE_LABEL) {
+      if (label_type_ == SINGLE_LABEL || label_type_ == SINGLE_LABEL_WEIGHTED) {
         DCHECK_EQ(label_proto.float_data_size(), 1);
         prefetched_label_.mutable_data<float>()[item_id] =
             label_proto.float_data(0);
@@ -565,7 +599,7 @@ bool ImageInputOp<Context>::GetImageAndLabelAndInfoFromDBValue(
         LOG(ERROR) << "Unknown label type:" << label_type_;
       }
     } else if (label_proto.data_type() == TensorProto::INT32) {
-      if (label_type_ == SINGLE_LABEL) {
+      if (label_type_ == SINGLE_LABEL || label_type_ == SINGLE_LABEL_WEIGHTED) {
         DCHECK_EQ(label_proto.int32_data_size(), 1);
         prefetched_label_.mutable_data<int>()[item_id] =
             label_proto.int32_data(0);
@@ -625,8 +659,16 @@ bool ImageInputOp<Context>::GetImageAndLabelAndInfoFromDBValue(
         for (int j = 0; j < additional_output_proto.int64_data_size(); ++j) {
           additional_output[j] = additional_output_proto.int64_data(j);
         }
-      }
-      else {
+      } else if (additional_output_proto.data_type() == TensorProto::UINT8) {
+        uint8_t* additional_output =
+            prefetched_additional_outputs_[i].template mutable_data<uint8_t>() +
+            item_id * additional_output_proto.int32_data_size();
+
+        for (int j = 0; j < additional_output_proto.int32_data_size(); ++j) {
+          additional_output[j] =
+              static_cast<uint8_t>(additional_output_proto.int32_data(j));
+        }
+      } else {
         LOG(FATAL) << "Unsupported output type.";
       }
     }
@@ -725,6 +767,7 @@ bool ImageInputOp<Context>::GetImageAndLabelAndInfoFromDBValue(
         *img = scaled_img;
       }
   }
+
   // TODO(Yangqing): return false if any error happens.
   return true;
 }
@@ -1027,9 +1070,8 @@ void ImageInputOp<Context>::DecodeAndTransform(
   cv::Mat img;
   // Decode the image
   PerImageArg info;
-  CHECK(GetImageAndLabelAndInfoFromDBValue(value, &img, info, item_id,
-    randgen));
-
+  CHECK(
+      GetImageAndLabelAndInfoFromDBValue(value, &img, info, item_id, randgen));
   // Factor out the image transformation
   TransformImage<Context>(img, channels, image_data,
     color_jitter_, img_saturation_, img_brightness_, img_contrast_,
@@ -1051,8 +1093,8 @@ void ImageInputOp<Context>::DecodeAndTransposeOnly(
   cv::Mat img;
   // Decode the image
   PerImageArg info;
-  CHECK(GetImageAndLabelAndInfoFromDBValue(value, &img, info, item_id,
-    randgen));
+  CHECK(
+      GetImageAndLabelAndInfoFromDBValue(value, &img, info, item_id, randgen));
 
   // Factor out the image transformation
   CropTransposeImage<Context>(img, channels, image_data, crop_, mirror_,
@@ -1115,6 +1157,9 @@ bool ImageInputOp<Context>::Prefetch() {
           } else if (
               additional_output_proto.data_type() == TensorProto::INT64) {
             prefetched_additional_outputs_[i].template mutable_data<int64_t>();
+          } else if (
+              additional_output_proto.data_type() == TensorProto::UINT8) {
+            prefetched_additional_outputs_[i].template mutable_data<uint8_t>();
           } else {
             LOG(FATAL) << "Unsupported output type.";
           }
@@ -1151,29 +1196,41 @@ bool ImageInputOp<Context>::Prefetch() {
   }
   thread_pool_->waitWorkComplete();
 
+  // we allow to get at most max_decode_error_ratio from
+  // opencv imdecode until raising a runtime exception
+  if ((float)num_decode_errors_in_batch_ / batch_size_ >
+      max_decode_error_ratio_) {
+    throw std::runtime_error(
+        "max_decode_error_ratio exceeded " +
+        caffe2::to_string(max_decode_error_ratio_));
+  }
+
   // If the context is not CPUContext, we will need to do a copy in the
   // prefetch function as well.
   if (!std::is_same<Context, CPUContext>::value) {
-    prefetched_image_on_device_.CopyFrom(prefetched_image_, &context_);
-    prefetched_label_on_device_.CopyFrom(prefetched_label_, &context_);
+    prefetched_image_on_device_.CopyFrom(prefetched_image_, &cpu_context_);
+    prefetched_label_on_device_.CopyFrom(prefetched_label_, &cpu_context_);
 
     for (int i = 0; i < prefetched_additional_outputs_on_device_.size(); ++i) {
       prefetched_additional_outputs_on_device_[i].CopyFrom(
-          prefetched_additional_outputs_[i], &context_);
+          prefetched_additional_outputs_[i], &cpu_context_);
     }
   }
+
+  num_decode_errors_in_batch_ = 0;
+
   return true;
 }
 
 template <class Context>
 bool ImageInputOp<Context>::CopyPrefetched() {
-  auto* image_output = OperatorBase::Output<Tensor<Context> >(0);
-  auto* label_output = OperatorBase::Output<Tensor<Context> >(1);
-  vector<Tensor<Context>*> additional_outputs_output;
+  auto type = Context::GetDeviceType();
+  auto* image_output = OperatorBase::Output<Tensor>(0, type);
+  auto* label_output = OperatorBase::Output<Tensor>(1, type);
+  vector<Tensor*> additional_outputs_output;
 
   for (int i = 2; i < OutputSize(); ++i) {
-    additional_outputs_output.push_back(
-        OperatorBase::Output<Tensor<Context>>(i));
+    additional_outputs_output.push_back(OperatorBase::Output<Tensor>(i, type));
   }
 
   // Note(jiayq): The if statement below should be optimized away by the
@@ -1193,10 +1250,12 @@ bool ImageInputOp<Context>::CopyPrefetched() {
         mean_gpu_.Resize(mean_.size());
         std_gpu_.Resize(std_.size());
 
-        context_.template Copy<float, CPUContext, Context>(
-          mean_.size(), mean_.data(), mean_gpu_.template mutable_data<float>());
-        context_.template Copy<float, CPUContext, Context>(
-          std_.size(), std_.data(), std_gpu_.template mutable_data<float>());
+        context_.template CopyFromCPU<float>(
+            mean_.size(),
+            mean_.data(),
+            mean_gpu_.template mutable_data<float>());
+        context_.template CopyFromCPU<float>(
+            std_.size(), std_.data(), std_gpu_.template mutable_data<float>());
         mean_std_copied_ = true;
       }
       // GPU transform kernel allows explicitly setting output type

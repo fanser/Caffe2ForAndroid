@@ -22,7 +22,7 @@ class SimpleNet : public NetBase {
   bool SupportsAsync() override {
     return false;
   }
-  bool RunAsync() override;
+
   vector<float> TEST_Benchmark(
       const int warmup_runs,
       const int main_runs,
@@ -43,6 +43,9 @@ class SimpleNet : public NetBase {
   }
 
  protected:
+  bool Run() override;
+  bool RunAsync() override;
+
   vector<unique_ptr<OperatorBase>> operators_;
 
   DISABLE_COPY_AND_ASSIGN(SimpleNet);

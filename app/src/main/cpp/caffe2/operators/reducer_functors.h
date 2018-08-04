@@ -1,4 +1,3 @@
-// Copyright 2004-present Facebook. All Rights Reserved.
 
 #ifndef CAFFE2_OPERATORS_RECUDER_FUNCTORS_H_
 #define CAFFE2_OPERATORS_RECUDER_FUNCTORS_H_
@@ -7,6 +6,7 @@
 
 #include "caffe2/core/context.h"
 #include "caffe2/core/tensor.h"
+#include "caffe2/utils/eigen_utils.h"
 #include "caffe2/utils/math.h"
 #include "caffe2/utils/proto_utils.h"
 
@@ -51,7 +51,7 @@ class SumRangeReducerGradient {
       Context* context) {
     // do we have some op that does it smartly with minimum number of memcpy?
     for (TIndex i = 0; i < blocks; ++i) {
-      context->template Copy<T, Context, Context>(
+      context->template CopySameDevice<T>(
           block_size, segment_grad, data_grad + block_size * i);
     }
   }
@@ -342,8 +342,7 @@ class BaseReducer {
                              : size_from_dim_(dims.size() - skip_dims, dims);
     }
 
-    void
-    observeInput(int input, const Tensor<CPUContext>& value, int skip_dims) {
+    void observeInput(int input, const Tensor& value, int skip_dims) {
       DCHECK_EQ(0, input);
       auto& dims = value.dims();
       computeMeta(dims, skip_dims);
@@ -394,10 +393,7 @@ class BaseReducerGradient {
     vector<TIndex> block_shape;
     bool first_dim;
 
-    Meta(
-        const Tensor<CPUContext>& out_grad,
-        int skip_dims,
-        bool first_dim = true)
+    Meta(const Tensor& out_grad, int skip_dims, bool first_dim = true)
         : first_dim(first_dim) {
       auto& dims = out_grad.dims();
       first_dim ? block_shape.assign(dims.begin() + skip_dims, dims.end())
@@ -409,8 +405,8 @@ class BaseReducerGradient {
 
     void observeOriginalInput(
         int /*original_input*/,
-        const Tensor<CPUContext>& /*value*/,
-        Tensor<CPUContext>* /*input_grad*/, // optional grad to populate
+        const Tensor& /*value*/,
+        Tensor* /*input_grad*/, // optional grad to populate
         int /*skip_dims*/) {}
 
     void appendGradShape(vector<TIndex>* output_shape) {
@@ -479,8 +475,7 @@ class SumReducerGradient : public BaseReducerGradient {
     if (FixedSize == 1) { // static if
       *data_grad = *s_grad_;
     } else if (meta.first_dim) {
-      context->template Copy<T, Context, Context>(
-          meta.block_size, s_grad_, data_grad);
+      context->template CopySameDevice<T>(meta.block_size, s_grad_, data_grad);
     } else {
       math::Set<T, Context>(length, s_grad_[offset], data_grad, context);
     }
@@ -522,8 +517,7 @@ class WeightedSumReducer<T, CPUContext> : public BaseReducer {
 
     explicit Meta(bool first = true) : first_dim(first) {}
 
-    void
-    observeInput(int input, const Tensor<CPUContext>& value, int skip_dims) {
+    void observeInput(int input, const Tensor& value, int skip_dims) {
       if (input == 1) {
         CAFFE_ENFORCE_EQ(
             skip_dims, value.ndim(), "SCALARS mustn't have extra dimensions");
@@ -559,7 +553,7 @@ class WeightedSumReducerGradient : public BaseReducerGradient {
  public:
   // which of the original inputs are required for gradient computation
   static constexpr std::array<int, 1> originalInputs() {
-    return {1};
+    return {{1}};
   }
 
   static int numAuxInputsWithGrads(const OperatorDef& def) {
@@ -580,14 +574,14 @@ class WeightedSumReducerGradient : public BaseReducerGradient {
 
     void observeOriginalInput(
         int original_input,
-        const Tensor<CPUContext>& value,
-        Tensor<CPUContext>* input_grad, // optional grad to populate
+        const Tensor& value,
+        Tensor* input_grad, // optional grad to populate
         int /*skip_dims*/) {
       CAFFE_ENFORCE_EQ(1, original_input);
       scalars = value.data<T>();
       if (input_grad) {
         input_grad->ResizeLike(value);
-        scalars_grad = input_grad->mutable_data<T>();
+        scalars_grad = input_grad->template mutable_data<T>();
       }
     }
   };
@@ -644,7 +638,7 @@ struct WeightedSumReducerDef {
         1,
         "SCALARS",
         "Scalar multipliers for the input slices. Must be a vector with the "
-        "length matching the first dimension of DATA");
+        "length matching the number of slices");
     schema.Arg(
         "grad_on_weights",
         "Produce also gradient for `weights`. For now it's only supported in "
@@ -762,7 +756,10 @@ class MaxReducer<T, CPUContext> : public BaseReducer {
   using FixedDispatch = FixedValues<1>;
 
   MaxReducer(const Meta& meta, T* out, CPUContext* /*context*/)
-      : out_(out), current_size_(0) {}
+      : out_(out), current_size_(0) {
+    // add a wrapper in Context for it
+    memset(out, 0, sizeof(T) * meta.block_size);
+  }
 
   template <int FixedSize>
   void process(

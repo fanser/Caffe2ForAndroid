@@ -1,9 +1,9 @@
-// Copyright 2004-present Facebook. All Rights Reserved.
 
 #pragma once
 
 #include "caffe2/core/context.h"
 #include "caffe2/core/operator.h"
+#include "caffe2/utils/math.h"
 
 namespace caffe2 {
 
@@ -11,13 +11,13 @@ namespace {
 
 template <class SIndex, class Context>
 bool SliceImpl(
-    Tensor<Context>* output,
-    const Tensor<Context>& data,
-    const Tensor<Context>& starts,
-    const Tensor<Context>& ends,
+    Tensor* output,
+    const Tensor& data,
+    const Tensor& starts,
+    const Tensor& ends,
     Context* context,
-    Tensor<Context>* gdata = nullptr,
-    const Tensor<Context>* go = nullptr) {
+    Tensor* gdata = nullptr,
+    const Tensor* go = nullptr) {
   bool backward = output == nullptr;
 
   auto* starts_data = starts.template data<SIndex>();
@@ -47,10 +47,14 @@ bool SliceImpl(
       if (end < 0) {
         end = data.dims()[i] + 1 + end;
       }
+      if (start > data.dims()[i]) {
+        start = data.dims()[i];
+      }
+      if (end > data.dims()[i]) {
+        end = data.dims()[i];
+      }
       CAFFE_ENFORCE_GE(start, 0);
       CAFFE_ENFORCE_GE(end, 0);
-      CAFFE_ENFORCE_LT(start, data.dims()[i]);
-      CAFFE_ENFORCE_LE(end, data.dims()[i]);
       CAFFE_ENFORCE_GE(end, start);
       starts_idx[i] = start;
       ends_idx[i] = end;
@@ -136,7 +140,7 @@ bool SliceImpl(
       DCHECK_LE(
           static_cast<void*>(local_dst_offset_bytes + dst_block_size_bytes),
           static_cast<void*>(dst_bytes + dst_nbytes));
-      context->template CopyItems<Context, Context>(
+      context->CopyItemsSameDevice(
           data.meta(),
           dst_block_size,
           (void*)local_src_offset_bytes,
@@ -182,7 +186,7 @@ bool SliceImpl(
       DCHECK_LE(
           local_dst_offset_bytes + src_block_size_bytes,
           dst_bytes + dst_nbytes);
-      context->template CopyItems<Context, Context>(
+      context->CopyItemsSameDevice(
           go->meta(),
           src_block_size,
           (void*)local_src_offset_bytes,
@@ -205,12 +209,17 @@ class SliceOp : public Operator<Context> {
         statically_inited_(false) {}
 
   bool RunOnDevice() override {
-    auto* output = Output(0);
-    auto& data = Input(0);
+    return RunOnDeviceImpl(Input(0), Output(0));
+  }
 
+  // This cannot be enabled given the output dims depends on the input
+  DISABLE_INPUT_FILLERS(Context)
+
+ protected:
+  bool RunOnDeviceImpl(const Tensor& data, Tensor* output) {
     if (InputSize() > 1) {
-      starts_host_.template CopyFrom<Context>(Input(1));
-      ends_host_.template CopyFrom<Context>(Input(2));
+      starts_host_.CopyFrom(Input(1));
+      ends_host_.CopyFrom(Input(2));
     } else {
       if (!statically_inited_) {
         CAFFE_ENFORCE(HasArgument("starts"));
@@ -242,8 +251,8 @@ class SliceOp : public Operator<Context> {
   std::vector<SIndex> starts_;
   std::vector<SIndex> ends_;
   bool statically_inited_;
-  TensorCPU starts_host_;
-  TensorCPU ends_host_;
+  Tensor starts_host_{CPU};
+  Tensor ends_host_{CPU};
 };
 
 template <class SIndex, class Context>
@@ -261,8 +270,8 @@ class SliceGradientOp : public Operator<Context> {
     auto& data = Input(0);
 
     if (InputSize() == 4) {
-      starts_host_.template CopyFrom<Context>(Input(1));
-      ends_host_.template CopyFrom<Context>(Input(2));
+      starts_host_.CopyFrom(Input(1));
+      ends_host_.CopyFrom(Input(2));
 
       auto& go = Input(3);
 
@@ -301,7 +310,7 @@ class SliceGradientOp : public Operator<Context> {
   std::vector<SIndex> starts_;
   std::vector<SIndex> ends_;
   bool statically_inited_;
-  TensorCPU starts_host_;
-  TensorCPU ends_host_;
+  Tensor starts_host_{CPU};
+  Tensor ends_host_{CPU};
 };
 } // namespace caffe2

@@ -1,4 +1,3 @@
-// Copyright 2004-present Facebook. All Rights Reserved.
 
 #ifndef CAFFE2_OPERATORS_LENGTHS_REDUCER_ROWWISE_8bits_OP_H_
 #define CAFFE2_OPERATORS_LENGTHS_REDUCER_ROWWISE_8bits_OP_H_
@@ -9,12 +8,13 @@
 #include "caffe2/core/operator.h"
 #include "caffe2/operators/reducer_functors.h"
 #include "caffe2/perfkernels/embedding_lookup.h"
+#include "caffe2/utils/eigen_utils.h"
 #include "caffe2/utils/math.h"
 
 namespace caffe2 {
 
 namespace {
-const float kEqualityThreshold = 1e-10;
+const float kEqualityThreshold = 1e-10f;
 }
 
 template <
@@ -86,6 +86,8 @@ class SparseLengths8BitsRowwiseOp : public Operator<Context> {
 
     return true;
   }
+
+  USE_VALUE_LENGTH_INPUT_FILLERS(Context, DATA, LENGTHS)
 
   enum {
     DATA = 0,

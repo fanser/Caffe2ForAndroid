@@ -15,6 +15,7 @@
 #include "caffe2/operators/conv_op_shared.h"
 #include "caffe2/operators/conv_transpose_op_mobile.h"
 #include "caffe2/utils/cpu_neon.h"
+#include "caffe2/utils/eigen_utils.h"
 #include "caffe2/utils/fixed_divisor.h"
 #include "caffe2/utils/math.h"
 
@@ -115,7 +116,7 @@ void runTileContiguous(
         Ydata + c_im * outputH * (colBlockSize * numColBlocks) + offsetY;
 
     int b = 0;
-#ifdef __ARM_NEON__
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
     // We vectorize the loop within the row
     {
       constexpr int kUnroll = (sizeof(float32x4_t) / sizeof(float)) * 4;
@@ -179,7 +180,7 @@ struct StoreInterleaved {};
 
 template <>
 struct StoreInterleaved<float, 1> {
-#ifdef __ARM_NEON__
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
   inline static void store(float* p, float32x4_t v[1]) {
     vst1q_f32(p, v[0]);
   }
@@ -192,7 +193,7 @@ struct StoreInterleaved<float, 1> {
 
 template <>
 struct StoreInterleaved<float, 2> {
-#ifdef __ARM_NEON__
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
   inline static void store(float* p, float32x4_t v[2]) {
     float32x4x2_t x = {{v[0], v[1]}};
     vst2q_f32(p, x);
@@ -207,7 +208,7 @@ struct StoreInterleaved<float, 2> {
 
 template <>
 struct StoreInterleaved<float, 3> {
-#ifdef __ARM_NEON__
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
   inline static void store(float* p, float32x4_t v[3]) {
     float32x4x3_t x = {{v[0], v[1], v[2]}};
     vst3q_f32(p, x);
@@ -223,7 +224,7 @@ struct StoreInterleaved<float, 3> {
 
 template <>
 struct StoreInterleaved<float, 4> {
-#ifdef __ARM_NEON__
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
   inline static void store(float* p, float32x4_t v[4]) {
     float32x4x4_t x = {{v[0], v[1], v[2], v[3]}};
     vst4q_f32(p, x);
@@ -264,12 +265,12 @@ void reinterleaveRows(
   dst += point * outputW;
 
   float b = bias ? bias[c] : 0;
-#ifdef __ARM_NEON__
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
   float32x4_t biasV = vdupq_n_f32(b);
 #endif
 
   int w = 0;
-#ifdef __ARM_NEON__
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
   constexpr int kUnroll = (sizeof(float32x4_t) / sizeof(float)) * 2;
   int limit = ((inputW - 1) / kUnroll) * kUnroll;
 
@@ -384,7 +385,7 @@ void reinterleaveMultithreaded(
                                                         size_t tileId) {
     int h;
     int c;
-    divOutputH.divMod((int)tileId, c, h);
+    divOutputH.DivMod((int)tileId, &c, &h);
 
     REINTERLEAVE(N);
   };
@@ -394,7 +395,7 @@ void reinterleaveMultithreaded(
   pool->run(fnReinterleave, totalTiles);
 }
 
-#ifdef __ARM_NEON__
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
 template <int N>
 struct SumMultiple {
   static void sumInto(float* acc, float** toSum, size_t size);
@@ -505,7 +506,7 @@ struct SumMultiple<3> {
 
 // Performs acc[i] += sum_j toSum_j[i] pointwise
 void sumInto(float* acc, std::vector<float*>& toSum, size_t size) {
-#ifdef __ARM_NEON__
+#if defined(__ARM_NEON__) || defined(__ARM_NEON)
   if (toSum.size() == 1) {
     SumMultiple<1>::sumInto(acc, toSum.data(), size);
     return;
@@ -528,9 +529,9 @@ void sumInto(float* acc, std::vector<float*>& toSum, size_t size) {
 
 template <typename T, class Context>
 bool ConvTransposeMobileOp<T, Context>::RunOnDeviceWithOrderNCHW() {
-  const Tensor<Context>& X = Input(INPUT);
+  const Tensor& X = Input(INPUT);
   auto& filter = Input(FILTER);
-  Tensor<Context>* Y = Output(0);
+  Tensor* Y = Output(0);
   const int N = X.dim32(0), M = X.dim32(1), H = X.dim32(2), W = X.dim32(3);
   CAFFE_ENFORCE(filter.ndim() == 4, "filter must be 4D tensor");
   CAFFE_ENFORCE(
@@ -605,7 +606,7 @@ bool ConvTransposeMobileOp<T, Context>::RunOnDeviceWithOrderNCHW() {
         &context_);
   };
 
-  auto f = [&](Tensor<Context>* threadBuffer) {
+  auto f = [&](Tensor* threadBuffer) {
     threadBuffer->Resize(
         numThreads * threadYBufferSizeAligned +
         numThreads * threadColBufferSize);

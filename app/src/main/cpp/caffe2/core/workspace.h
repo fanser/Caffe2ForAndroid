@@ -4,14 +4,11 @@
 #include "caffe2/core/common.h"
 #include "caffe2/core/observer.h"
 
-#ifndef CAFFE2_MOBILE
-#error "mobile build state not defined"
-#endif
-
 #include <climits>
 #include <cstddef>
 #include <mutex>
 #include <typeinfo>
+#include <unordered_set>
 #include <vector>
 
 #include "caffe2/core/blob.h"
@@ -19,9 +16,7 @@
 #include "caffe2/core/net.h"
 #include "caffe2/proto/caffe2.pb.h"
 #include "caffe2/utils/signal_handler.h"
-#if CAFFE2_MOBILE
 #include "caffe2/utils/threadpool/ThreadPool.h"
-#endif // CAFFE2_MOBILE
 
 CAFFE2_DECLARE_bool(caffe2_print_blob_sizes_at_exit);
 
@@ -112,11 +107,46 @@ class Workspace {
   }
 
   /**
-   * Add blob mappings from another workspace
+   * Adds blob mappings from workspace to the blobs from parent workspace.
+   * Creates blobs under possibly new names that redirect read/write operations
+   * to the blobs in the parent workspace.
+   * Arguments:
+   *  parent - pointer to parent workspace
+   *  forwarded_blobs - map from new blob name to blob name in parent's
+   * workspace skip_defined_blob - if set skips blobs with names that already
+   * exist in the workspace, otherwise throws exception
    */
   void AddBlobMapping(
       const Workspace* parent,
-      const std::unordered_map<string, string>& forwarded_blobs);
+      const std::unordered_map<string, string>& forwarded_blobs,
+      bool skip_defined_blobs = false);
+
+  /**
+   * Converts previously mapped tensor blobs to local blobs, copies values from
+   * parent workspace blobs into new local blobs. Ignores undefined blobs.
+   */
+  template <class Context>
+  void CopyForwardedTensors(const std::unordered_set<std::string>& blobs) {
+    for (const auto& blob : blobs) {
+      if (!forwarded_blobs_.count(blob)) {
+        continue;
+      }
+      const auto& ws_blob = forwarded_blobs_[blob];
+      const auto* parent_ws = ws_blob.first;
+      auto* from_blob = parent_ws->GetBlob(ws_blob.second);
+      CAFFE_ENFORCE(from_blob);
+      CAFFE_ENFORCE(
+          from_blob->template IsType<Tensor>(),
+          "Expected blob with tensor value",
+          ws_blob.second);
+      forwarded_blobs_.erase(blob);
+      auto* to_blob = CreateBlob(blob);
+      CAFFE_ENFORCE(to_blob);
+      const auto& from_tensor = from_blob->template Get<Tensor>();
+      auto* to_tensor = to_blob->GetMutableTensor(Context::GetDeviceType());
+      to_tensor->CopyFrom(from_tensor);
+    }
+  }
 
   /**
    * Return list of blobs owned by this Workspace, not including blobs
@@ -162,6 +192,14 @@ class Workspace {
    */
   Blob* CreateBlob(const string& name);
   /**
+   * Similar to CreateBlob(), but it creates a blob in the local workspace even
+   * if another blob with the same name already exists in the parent workspace
+   * -- in such case the new blob hides the blob in parent workspace. If a blob
+   * of the given name already exists in the local workspace, the creation is
+   * skipped and the existing blob is returned.
+   */
+  Blob* CreateLocalBlob(const string& name);
+  /**
    * Remove the blob of the given name. Return true if removed and false if
    * not exist.
    * Will NOT remove from the shared workspace.
@@ -177,6 +215,13 @@ class Workspace {
    * not exist, a nullptr is returned.
    */
   Blob* GetBlob(const string& name);
+
+  /**
+   * Renames a local workspace blob. If blob is not found in the local blob list
+   * or if the target name is already present in local or any parent blob list
+   * the function will throw.
+   */
+  Blob* RenameBlob(const string& old_name, const string& new_name);
 
   /**
    * Creates a network with the given NetDef, and returns the pointer to the
@@ -224,14 +269,12 @@ class Workspace {
   bool RunPlan(const PlanDef& plan_def,
                ShouldContinue should_continue = StopOnSignal{});
 
-#if CAFFE2_MOBILE
   /*
    * Returns a CPU threadpool instace for parallel execution of
    * work. The threadpool is created lazily; if no operators use it,
    * then no threadpool will be created.
    */
   ThreadPool* GetThreadPool();
-#endif
 
   // RunOperatorOnce and RunNetOnce runs an operator or net once. The difference
   // between RunNet and RunNetOnce lies in the fact that RunNet allows you to
@@ -251,10 +294,8 @@ class Workspace {
   const Workspace* shared_;
   std::unordered_map<string, std::pair<const Workspace*, string>>
       forwarded_blobs_;
-#if CAFFE2_MOBILE
   std::unique_ptr<ThreadPool> thread_pool_;
   std::mutex thread_pool_creation_mutex_;
-#endif // CAFFE2_MOBILE
 
   DISABLE_COPY_AND_ASSIGN(Workspace);
 };

@@ -20,13 +20,18 @@ class AsyncDAGNet : public DAGNetBase {
   bool SupportsAsync() override {
     return true;
   }
-  bool RunAt(const std::vector<int>& chain) override;
-  bool RunAsync() override;
+  bool RunAt(int chain_id, const std::vector<int>& chain) override;
 
  protected:
+  bool DoRunAsync() override;
+
   // Tracks whether a given op has had an event recorded in each
   // RunAt() iteration.
   std::vector<int32_t> eventRecorded_;
+
+  int stream(const DeviceOption& device_option);
+  static thread_local std::vector<int> stream_counters_;
+
   DISABLE_COPY_AND_ASSIGN(AsyncDAGNet);
 };
 

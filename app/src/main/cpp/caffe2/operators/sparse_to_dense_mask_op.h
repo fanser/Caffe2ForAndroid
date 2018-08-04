@@ -17,14 +17,15 @@ class SparseToDenseMaskBase : public Operator<Context> {
   USE_OPERATOR_CONTEXT_FUNCTIONS;
   SparseToDenseMaskBase(const OperatorDef& operator_def, Workspace* ws)
       : Operator<Context>(operator_def, ws) {
-    std::vector<int> mask =
-        OperatorBase::template GetRepeatedArgument<int>("mask");
+    std::vector<int64_t> mask =
+        OperatorBase::template GetRepeatedArgument<int64_t>("mask");
     featuresCount_ = mask.size();
+
     CAFFE_ENFORCE(!mask.empty(), "mask can't be empty");
     auto biggest = *std::max_element(mask.begin(), mask.end());
     dense_.assign(std::min(kMaxDenseSize, biggest + 1), -1);
     for (int i = 0; i < mask.size(); i++) {
-      int id = mask[i];
+      int64_t id = mask[i];
       CAFFE_ENFORCE_GE(id, 0, "Only positive IDs are allowed.");
       if (id >= kMaxDenseSize) {
         CAFFE_ENFORCE(sparse_.count(id) == 0, "Duplicated id: ", id);
@@ -36,14 +37,17 @@ class SparseToDenseMaskBase : public Operator<Context> {
     }
   }
 
- protected:
-  const int kMaxDenseSize = 1024 * 128;
+  // TODO: enable the filler
+  DISABLE_INPUT_FILLERS(Context)
 
-  std::unordered_map<int, int> sparse_;
+ protected:
+  const int64_t kMaxDenseSize = 1024 * 128;
+
+  std::unordered_map<int64_t, int> sparse_;
   std::vector<int> dense_;
   int featuresCount_;
 
-  inline int getFeatureIdx(int id) const {
+  inline int getFeatureIdx(int64_t id) const {
     if (id >= kMaxDenseSize) {
       const auto& iter = sparse_.find(id);
       if (iter == sparse_.end()) {
@@ -65,6 +69,9 @@ class SparseToDenseMaskOp : public SparseToDenseMaskBase<Context> {
       : SparseToDenseMaskBase<Context>(operator_def, ws) {
     returnPresenceMask_ = OperatorBase::template GetSingleArgument<bool>(
         "return_presence_mask", false);
+    maxSkippedSparseIndices_ =
+        OperatorBase::template GetSingleArgument<int32_t>(
+            "max_skipped_indices", kMaxSkippedSparseIndices);
   }
 
   bool RunOnDevice() override {
@@ -97,7 +104,7 @@ class SparseToDenseMaskOp : public SparseToDenseMaskBase<Context> {
     int32_t sparse_indices_length = sparse_indices.dim32(0);
     const int32_t* lengths_vec = nullptr;
     auto* output = Output(OUTPUTVALUE);
-    Tensor<Context>* presence_mask = nullptr;
+    Tensor* presence_mask = nullptr;
     if (returnPresenceMask_) {
       presence_mask = Output(PRESENCEMASK);
     }
@@ -128,7 +135,7 @@ class SparseToDenseMaskOp : public SparseToDenseMaskBase<Context> {
     char* output_data =
         static_cast<char*>(output->raw_mutable_data(sparse_values.meta()));
     for (int i = 0; i < cols * rows; i++) {
-      context_.template CopyItems<Context, Context>(
+      context_.CopyItemsSameDevice(
           default_value.meta(),
           block_size,
           default_val,
@@ -141,22 +148,21 @@ class SparseToDenseMaskOp : public SparseToDenseMaskBase<Context> {
           rows * cols, false, presence_mask_data, &context_);
     }
 
-    CAFFE_ENFORCE(
-        (ConstEigenVectorArrayMap<TInd>(
-             sparse_indices_vec, sparse_indices_length) <
-         std::numeric_limits<int32_t>::max())
-                .all() &&
-            (ConstEigenVectorArrayMap<TInd>(
-                 sparse_indices_vec, sparse_indices_length) >= 0)
-                .all(),
-        "All indices must be representable as non-negative int32_t numbers");
-
-    int32_t offset = 0;
+    int64_t offset = 0;
     for (int r = 0; r < rows; r++) {
       for (int c = 0; c < lengths_vec[r]; c++) {
-        int idx = this->getFeatureIdx(sparse_indices_vec[offset + c]);
+        const auto sparse_index = sparse_indices_vec[offset + c];
+        if (sparse_index < 0 ||
+            sparse_index >= std::numeric_limits<TInd>::max()) {
+          CAFFE_ENFORCE_LT(
+              ++skippedSparseIndices_,
+              maxSkippedSparseIndices_,
+              "Too many sparse indices skipped");
+          continue;
+        }
+        int idx = this->getFeatureIdx(sparse_index);
         if (idx != -1) {
-          context_.template CopyItems<Context, Context>(
+          context_.CopyItemsSameDevice(
               sparse_values.meta(),
               block_size,
               sparse_values_vec + (offset + c) * block_nbytes,
@@ -173,7 +179,11 @@ class SparseToDenseMaskOp : public SparseToDenseMaskBase<Context> {
   }
 
  private:
+  static const uint32_t kMaxSkippedSparseIndices = 5;
+
   bool returnPresenceMask_;
+  uint32_t maxSkippedSparseIndices_ = 0;
+  uint32_t skippedSparseIndices_ = 0;
 
   INPUT_TAGS(INDICES, VALUES, DEFAULT, LENGTHS);
   OUTPUT_TAGS(OUTPUTVALUE, PRESENCEMASK);
@@ -256,7 +266,7 @@ class SparseToDenseMaskGradientOp : public SparseToDenseMaskBase<Context> {
         int idx = this->getFeatureIdx(sparse_indices_vec[offset + c]);
         if (idx != -1 && !gradient_used[idx]) {
           gradient_used[idx] = true;
-          context_.template CopyItems<Context, Context>(
+          context_.CopyItemsSameDevice(
               gradient_output.meta(),
               block_size,
               gradient_output_vec + (r * cols + idx) * block_nbytes,

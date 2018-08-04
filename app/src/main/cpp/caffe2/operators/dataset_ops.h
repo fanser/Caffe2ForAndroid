@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include "caffe2/core/blob.h"
+#include "caffe2/core/blob_serialization.h"
 #include "caffe2/core/tensor.h"
 
 namespace caffe2 {
@@ -190,10 +191,22 @@ class TreeWalker {
 
 using SharedTensorVectorPtr = std::shared_ptr<std::vector<TensorCPU>>;
 
-template <class Context>
-using TensorVectorPtr = std::unique_ptr<std::vector<Tensor<Context>>>;
+using TensorVectorPtr = std::unique_ptr<std::vector<Tensor>>;
 
-} // dataset_ops
-} // caffe2
+class SharedTensorVectorPtrSerializer : public BlobSerializerBase {
+ public:
+  void Serialize(
+      const Blob& blob,
+      const string& name,
+      BlobSerializerBase::SerializationAcceptor acceptor) override;
+};
+
+class SharedTensorVectorPtrDeserializer : public BlobDeserializerBase {
+ public:
+  void Deserialize(const BlobProto& proto, Blob* blob) override;
+};
+
+} // namespace dataset_ops
+} // namespace caffe2
 
 #endif // CAFFE2_OPERATORS_DATASET_OPS_H_

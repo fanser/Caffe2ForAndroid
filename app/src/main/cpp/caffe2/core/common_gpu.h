@@ -99,20 +99,6 @@ int NumCudaDevices();
 inline bool HasCudaGPU() { return NumCudaDevices() > 0; }
 
 /**
- * Sets the default GPU id for Caffe2.
- *
- * If an operator is set to run on Cuda GPU but no gpu id is given, we will use
- * the default gpu id to run the operator. Before this function is explicitly
- * called, GPU 0 will be the default GPU id.
- */
-void SetDefaultGPUID(const int deviceid);
-
-/**
- * Gets the default GPU id for Caffe2.
- */
-int GetDefaultGPUID();
-
-/**
  * Gets the current GPU id. This is a simple wrapper around cudaGetDevice().
  */
 int CaffeCudaGetDevice();
@@ -241,9 +227,8 @@ const char* curandGetErrorString(curandStatus_t error);
         << ::caffe2::curandGetErrorString(status); \
   } while (0)
 
-#define CUDA_1D_KERNEL_LOOP(i, n)                                              \
-  for (int i = blockIdx.x * blockDim.x + threadIdx.x;                          \
-       i < (n);                                                                \
+#define CUDA_1D_KERNEL_LOOP(i, n)                                 \
+  for (size_t i = blockIdx.x * blockDim.x + threadIdx.x; i < (n); \
        i += blockDim.x * gridDim.x)
 
 // CUDA_KERNEL_ASSERT is a macro that wraps an assert() call inside cuda
@@ -282,8 +267,12 @@ constexpr int CAFFE_MAXIMUM_NUM_BLOCKS = 4096;
  * @brief Compute the number of blocks needed to run N threads.
  */
 inline int CAFFE_GET_BLOCKS(const int N) {
-  return std::min((N + CAFFE_CUDA_NUM_THREADS - 1) / CAFFE_CUDA_NUM_THREADS,
-                  CAFFE_MAXIMUM_NUM_BLOCKS);
+  return std::max(
+      std::min(
+          (N + CAFFE_CUDA_NUM_THREADS - 1) / CAFFE_CUDA_NUM_THREADS,
+          CAFFE_MAXIMUM_NUM_BLOCKS),
+      // Use at least 1 block, since CUDA does not allow empty block
+      1);
 }
 
 class DeviceGuard {
@@ -302,5 +291,133 @@ class DeviceGuard {
   int previous_;
 };
 
-}  // namespace caffe2
-#endif  // CAFFE2_CORE_COMMON_GPU_H_
+template <typename T, int N>
+struct SimpleArray {
+  T data[N];
+};
+
+constexpr int kCUDATensorMaxDims = 8;
+
+#define DISPATCH_FUNCTION_BY_VALUE_WITH_TYPE_1(val, Func, T, ...) \
+  do {                                                            \
+    CAFFE_ENFORCE_LE(val, kCUDATensorMaxDims);                    \
+    switch (val) {                                                \
+      case 1: {                                                   \
+        Func<T, 1>(__VA_ARGS__);                                  \
+        break;                                                    \
+      }                                                           \
+      case 2: {                                                   \
+        Func<T, 2>(__VA_ARGS__);                                  \
+        break;                                                    \
+      }                                                           \
+      case 3: {                                                   \
+        Func<T, 3>(__VA_ARGS__);                                  \
+        break;                                                    \
+      }                                                           \
+      case 4: {                                                   \
+        Func<T, 4>(__VA_ARGS__);                                  \
+        break;                                                    \
+      }                                                           \
+      case 5: {                                                   \
+        Func<T, 5>(__VA_ARGS__);                                  \
+        break;                                                    \
+      }                                                           \
+      case 6: {                                                   \
+        Func<T, 6>(__VA_ARGS__);                                  \
+        break;                                                    \
+      }                                                           \
+      case 7: {                                                   \
+        Func<T, 7>(__VA_ARGS__);                                  \
+        break;                                                    \
+      }                                                           \
+      case 8: {                                                   \
+        Func<T, 8>(__VA_ARGS__);                                  \
+        break;                                                    \
+      }                                                           \
+      default: { break; }                                         \
+    }                                                             \
+  } while (false)
+
+#define DISPATCH_FUNCTION_BY_VALUE_WITH_TYPE_2(val, Func, T1, T2, ...) \
+  do {                                                                 \
+    CAFFE_ENFORCE_LE(val, kCUDATensorMaxDims);                         \
+    switch (val) {                                                     \
+      case 1: {                                                        \
+        Func<T1, T2, 1>(__VA_ARGS__);                                  \
+        break;                                                         \
+      }                                                                \
+      case 2: {                                                        \
+        Func<T1, T2, 2>(__VA_ARGS__);                                  \
+        break;                                                         \
+      }                                                                \
+      case 3: {                                                        \
+        Func<T1, T2, 3>(__VA_ARGS__);                                  \
+        break;                                                         \
+      }                                                                \
+      case 4: {                                                        \
+        Func<T1, T2, 4>(__VA_ARGS__);                                  \
+        break;                                                         \
+      }                                                                \
+      case 5: {                                                        \
+        Func<T1, T2, 5>(__VA_ARGS__);                                  \
+        break;                                                         \
+      }                                                                \
+      case 6: {                                                        \
+        Func<T1, T2, 6>(__VA_ARGS__);                                  \
+        break;                                                         \
+      }                                                                \
+      case 7: {                                                        \
+        Func<T1, T2, 7>(__VA_ARGS__);                                  \
+        break;                                                         \
+      }                                                                \
+      case 8: {                                                        \
+        Func<T1, T2, 8>(__VA_ARGS__);                                  \
+        break;                                                         \
+      }                                                                \
+      default: { break; }                                              \
+    }                                                                  \
+  } while (false)
+
+#define DISPATCH_FUNCTION_BY_VALUE_WITH_TYPE_3(val, Func, T1, T2, T3, ...) \
+  do {                                                                     \
+    CAFFE_ENFORCE_LE(val, kCUDATensorMaxDims);                             \
+    switch (val) {                                                         \
+      case 1: {                                                            \
+        Func<T1, T2, T3, 1>(__VA_ARGS__);                                  \
+        break;                                                             \
+      }                                                                    \
+      case 2: {                                                            \
+        Func<T1, T2, T3, 2>(__VA_ARGS__);                                  \
+        break;                                                             \
+      }                                                                    \
+      case 3: {                                                            \
+        Func<T1, T2, T3, 3>(__VA_ARGS__);                                  \
+        break;                                                             \
+      }                                                                    \
+      case 4: {                                                            \
+        Func<T1, T2, T3, 4>(__VA_ARGS__);                                  \
+        break;                                                             \
+      }                                                                    \
+      case 5: {                                                            \
+        Func<T1, T2, T3, 5>(__VA_ARGS__);                                  \
+        break;                                                             \
+      }                                                                    \
+      case 6: {                                                            \
+        Func<T1, T2, T3, 6>(__VA_ARGS__);                                  \
+        break;                                                             \
+      }                                                                    \
+      case 7: {                                                            \
+        Func<T1, T2, T3, 7>(__VA_ARGS__);                                  \
+        break;                                                             \
+      }                                                                    \
+      case 8: {                                                            \
+        Func<T1, T2, T3, 8>(__VA_ARGS__);                                  \
+        break;                                                             \
+      }                                                                    \
+      default: { break; }                                                  \
+    }                                                                      \
+  } while (false)
+
+} // namespace caffe2
+
+#endif // CAFFE2_CORE_COMMON_GPU_H_
