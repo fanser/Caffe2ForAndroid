@@ -1,23 +1,26 @@
-## AICamera
+## Caffe2ForAndroid
 
-AICamera is a demo app that was displayed at Facebook's F8 event.  The previous version (also on this repo) was getting quite old and attempted to demonstrate a build system that happened inside Android Studio.  This led to some hacky techniques and I decided to rewrite the demo with a prebuilt Caffe2 library (which can be built using `build_android.sh` in the Caffe2 source).
+This project is based on [AICamera](https://github.com/caffe2/AICamera), which is a demo app. The app now supports six types classification: people, cup, mobile phone, computer, table and chair, which are collected from web.
 
-![example](https://thumbs.gfycat.com/FlimsyInbornIndianabat-size_restricted.gif)
+![demo](https://github.com/fanser/Caffe2ForAndroid/raw/master/demo.gif)
 
-### Download
-
-    git clone https://github.com/caffe2/AICamera.git
+### Introduction
+I train the classification network by finetuning the SqueezeNet1_1, and this stage is done by Pytorch. Then the pytorch model is transformed to caffemodel style.
 
 ### Build
+You can follow the introduction describled in [AICamera](https://github.com/caffe2/AICamera) to build this app.
 
-Click the green play button in Android Studio 3.0.1 and everything should build :)
+* Note: This app uses the updated caffe2 (pytorch) version, so some static libraries, like `libcaffe2.a` etc., are rebuild on my machine, and they are different from the original [AICamera](https://github.com/caffe2/AICamera). In this project, we provide the all corresponding libraries and the pretrained model to help you work successfully. It is noticeable that if you replace by own model, the app may don't work, which probably caused by the conflict of caffe2 version. In this situation, you can try rebuild the libraries like libcaffe2.a, which your models depend on, and update these together.
 
 ### Tests
 
 | Device             | Network       |  FPS  |
 | ------------------ | ------------- | ----- |
-| Samsung Galaxy S7  | SqueezeNet    |  5.8  |
-| Google Pixel       | SqueezeNet    |  5.7  |
+| Huawei Honor 8     | SqueezeNet    |  7.5 |
+
+### TODO
+* Segmentation
+* detection
 
 ### License
 
