@@ -5,7 +5,7 @@ This project is based on [AICamera](https://github.com/caffe2/AICamera), which i
 ![demo](https://github.com/fanser/Caffe2ForAndroid/raw/master/demo.gif)
 
 ### Introduction
-I train the classification network by finetuning the SqueezeNet1_1, and this stage is done by Pytorch. Then the pytorch model is transformed to caffemodel style.
+I trained the classification network by finetuning the SqueezeNet1_1, and this stage is done by Pytorch. Then the pytorch model is transformed to caffemodel style.
 
 ### Build
 You can follow the introduction describled in [AICamera](https://github.com/caffe2/AICamera) to build this app.
